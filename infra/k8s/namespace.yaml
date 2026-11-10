@@ -1,0 +1,6 @@
+# K8s 命名空间划分（占位）
+#
+# - ai-gateway-prod      生产
+# - ai-gateway-staging   预发
+# - ai-gateway-dev       开发
+# 每个 namespace 独立的 etcd / redis / kafka

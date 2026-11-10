@@ -1,0 +1,3 @@
+# Grafana 技术大盘（占位）
+# 面板：QPS / P99 延迟 / 错误率 / 熔断次数 / 缓存命中率 / 供应商健康
+# JSON 格式，Grafana 直接 import

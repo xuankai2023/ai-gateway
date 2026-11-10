@@ -1,0 +1,7 @@
+# K8s Gateway 部署清单（占位）
+#
+# - Deployment replicas: 3（最少 3 副本做 HA）
+# - HPA: 1 < replicas < 50，QPS 1000 扩容 / 200 缩容
+# - Secret: Provider API Key 从 Vault 挂载，不硬编码
+# - Liveness / Readiness 探针 /healthz /readyz
+# - Istio VirtualService 灰度流量切分（配合 Flagger 用）

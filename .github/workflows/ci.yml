@@ -1,0 +1,9 @@
+# CI Pipeline（占位）
+#
+# on: [push, pull_request]
+# jobs:
+#   - lint         golangci-lint + ruff + preact lint
+#   - unit-test    go test ./... -race + python -m pytest
+#   - build        build all apps
+#   - integration  docker compose up -d + go test -tags=integration
+#   - push         push Docker image to registry（only main branch）

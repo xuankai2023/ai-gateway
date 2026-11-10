@@ -1,0 +1,11 @@
+# Prometheus 抓取配置（占位）
+#
+# scrape_configs:
+#   - job_name: ai-gateway
+#     static_configs:
+#       - targets: ["gateway:8081"]   # /metrics 端点
+#   - job_name: ai-worker
+#     static_configs:
+#       - targets: ["worker:9091"]
+#
+# 规则文件：rules.yml（熔断告警 / 错误率告警 / P99 延迟告警）

@@ -1,0 +1,4 @@
+-- 回滚 002：删除 abilities 表
+SET FOREIGN_KEY_CHECKS = 0;
+DROP TABLE IF EXISTS abilities;
+SET FOREIGN_KEY_CHECKS = 1;

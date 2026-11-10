@@ -1,0 +1,22 @@
+# Go
+*.exe *.dll *.so *.dylib
+vendor/
+
+# Python
+__pycache__/ *.pyc .venv/
+
+# Node
+node_modules/ .next/
+
+# Config（不要把真实密钥提交）
+**/config.yaml
+**/.env
+**/.env.local
+.env*
+!.env.example
+
+# IDE
+.idea/ .vscode/ *.swp
+
+# OS
+.DS_Store

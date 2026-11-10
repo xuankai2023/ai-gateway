@@ -1,0 +1,5 @@
+# Worker 依赖（占位，后续根据实现版本号）
+# celery>=5.3
+# kafka-python>=2.0
+# httpx>=0.27
+# psycopg2-binary>=2.9

@@ -1,0 +1,37 @@
+# 网关开发环境配置模板（复制为 config.yaml 后修改）
+etcd:
+  endpoints: ["localhost:2379"]
+  dial_timeout: "5s"
+
+mysql:
+  dsn: "root:root@tcp(localhost:3306)/ai_gateway?charset=utf8mb4&parseTime=True&loc=Local"
+  pool_size: 20
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+
+kafka:
+  brokers: ["localhost:9092"]
+  group_id: "ai_gateway"
+
+qdrant:
+  addr: "localhost:6333"
+
+gateway:
+  listen_addr: ":8080"
+  listen_metrics: ":8081"
+  default_rps_limit: 10
+  default_tpm_limit: 10000
+
+# 供应商注册配置：API Key 只写环境变量名，真实密钥不落配置文件
+providers:
+  - type: openai
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "OPENAI_API_KEY"
+  - type: anthropic
+    base_url: "https://api.anthropic.com"
+    api_key_env: "ANTHROPIC_API_KEY"
+  - type: volcengine
+    base_url: "https://ark.cn-beijing.volces.com/api/v3"
+    api_key_env: "ARK_API_KEY"
