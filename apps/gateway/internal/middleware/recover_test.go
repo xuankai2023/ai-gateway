@@ -27,11 +27,26 @@ func TestRecoverReturns500JSON(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("响应不是 JSON: %v, raw=%q", err, w.Body.String())
 	}
-	if body["code"] != float64(500) {
-		t.Errorf("code = %v, want 500", body["code"])
+
+	// 统一错误契约：{"error":{"message","type","code"},"request_id"}
+	errObj, ok := body["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("error 字段缺失或类型不对: %v", body)
 	}
-	if body["message"] != "internal error" {
-		t.Errorf("message = %v, want internal error", body["message"])
+	if errObj["type"] != "internal_error" {
+		t.Errorf("error.type = %v, want internal_error", errObj["type"])
+	}
+	if errObj["code"] != "internal_panic" {
+		t.Errorf("error.code = %v, want internal_panic", errObj["code"])
+	}
+	if errObj["message"] != "internal error" {
+		t.Errorf("error.message = %v, want internal error", errObj["message"])
+	}
+	// Recover 在 Trace 外层，trace_id 可能缺失 → apperr 兜底生成，必须非空
+	if id, _ := body["request_id"].(string); id == "" {
+		t.Errorf("request_id 缺失: %v", body)
+	} else if w.Header().Get("X-Request-Id") != id {
+		t.Errorf("X-Request-Id header = %q, 与 body.request_id = %q 不一致", w.Header().Get("X-Request-Id"), id)
 	}
 }
 
