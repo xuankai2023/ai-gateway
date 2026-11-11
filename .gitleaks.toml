@@ -1,0 +1,13 @@
+# gitleaks 配置：放行测试夹具与示例配置（默认规则集之上叠加）
+[extend]
+  useDefault = true
+
+[allowlist]
+  description = "Allow test fixtures and example configs"
+  paths = [
+    '''(.*?)(jpg|gif|doc|pdf|bin|svg|socket)$''',
+    '''configs/config\.yaml$''',
+    '''config\.example\.yaml''',
+    '''_test\.go$''',
+    '''\.gitleaks\.toml$''',
+  ]

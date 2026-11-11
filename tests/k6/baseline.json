@@ -1,0 +1,14 @@
+{
+  "comment": "k6 性能基线（tests/k6/gateway_benchmark.js 单场景）",
+  "thresholds": {
+    "p99_latency_ms": 2000,
+    "qps": 30,
+    "error_rate": 0.01,
+    "p99_ttft_ms": 3000
+  },
+  "tolerance": {
+    "latency_regression": 1.10,
+    "qps_drop": 0.85,
+    "ttft_regression": 1.10
+  }
+}

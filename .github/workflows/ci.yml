@@ -1,9 +1,198 @@
-# CI Pipeline（占位）
+# CI Pipeline
 #
-# on: [push, pull_request]
-# jobs:
-#   - lint         golangci-lint + ruff + preact lint
-#   - unit-test    go test ./... -race + python -m pytest
-#   - build        build all apps
-#   - integration  docker compose up -d + go test -tags=integration
-#   - push         push Docker image to registry（only main branch）
+# 质量门禁（PR 合入前必须全绿）：
+#   - lint          go vet + golangci-lint
+#   - unit-test     全量单测（-race）+ 覆盖率门禁（>=60%）+ DB 迁移可逆性校验（up → down 1 → up）
+#   - build         编译所有 app（gateway / migrate / reconciler）
+#   - audit         govulncheck 依赖漏洞扫描
+#   - secret-scan   gitleaks 防 key 提交
+#   - perf          k6 基准 + 基线对比（仅 master 分支，见 tests/k6/）
+#
+# 说明：DB 是 MySQL（非 Postgres）；migrate CLI 走 --config 指定配置文件。
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+  unit-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: gateway_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod download
+
+      # 迁移可逆性校验：up 全量 → down 1 → 重新 up（针对测试库）
+      - name: Write CI test config
+        run: |
+          cat > /tmp/ci_config.yaml <<'EOF'
+          mysql:
+            dsn: "root:root@tcp(localhost:3306)/gateway_test?charset=utf8mb4&parseTime=True&loc=Local"
+          redis:
+            addr: "localhost:6379"
+          EOF
+      - name: Run migrations up
+        run: go run ./apps/migrate/cmd --config /tmp/ci_config.yaml up
+      - name: Run migrations down (reversibility check)
+        run: go run ./apps/migrate/cmd --config /tmp/ci_config.yaml down 1
+      - name: Re-run migrations up
+        run: go run ./apps/migrate/cmd --config /tmp/ci_config.yaml up
+
+      - run: go test ./... -race -count=1 -coverprofile=coverage.out
+
+      - name: Coverage gate (>=60%)
+        run: |
+          COV=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | sed 's/%//')
+          echo "Total coverage: ${COV}%"
+          awk "BEGIN {exit !($COV >= 60.0)}" || { echo "::error::Coverage ${COV}% below 60%"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build ./...
+      - run: go build -o /tmp/migrate ./apps/migrate/cmd
+      - run: go build -o /tmp/reconciler ./apps/reconciler/cmd
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  perf:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: gateway_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Write CI test config
+        run: |
+          cat > /tmp/ci_config.yaml <<'EOF'
+          mysql:
+            dsn: "root:root@tcp(localhost:3306)/gateway_test?charset=utf8mb4&parseTime=True&loc=Local"
+          redis:
+            addr: "localhost:6379"
+          gateway:
+            listen_addr: ":8080"
+          EOF
+      - name: Run migrations
+        run: go run ./apps/migrate/cmd --config /tmp/ci_config.yaml up
+
+      - name: Start gateway
+        run: |
+          go run ./apps/gateway/cmd --config /tmp/ci_config.yaml &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/livez && exit 0 || sleep 1
+          done
+          echo "gateway failed to start"; exit 1
+
+      - uses: grafana/k6-action@v0.3.1
+        with:
+          filename: tests/k6/gateway_benchmark.js
+          flags: --summary-export=/tmp/k6_summary.json
+
+      - name: Compare with baseline
+        run: go run ./tests/k6/check_baseline.go -summary /tmp/k6_summary.json -baseline tests/k6/baseline.json
