@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// newTestFactory 用独立工厂避免污染全局注册表
-func newTestFactory() *factoryImpl {
-	return &factoryImpl{}
+// newTestFactory 用独立 Registry 避免测试间相互污染（阶段 14：Registry 实例化）
+func newTestFactory() *Registry {
+	return NewRegistry()
 }
 
 func TestRegisterAndGet(t *testing.T) {

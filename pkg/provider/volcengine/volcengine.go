@@ -1,11 +1,11 @@
 // Package volcengine 火山方舟 Provider
 //
 // 火山方舟的 Chat Completions endpoint 是 OpenAI 兼容协议：
-//  - baseURL 官方示例：https://ark.cn-beijing.volces.com/api/v3
-//  - 请求路径：POST /chat/completions
-//  - 鉴权：Bearer {ARK_API_KEY}
-//  - 流式：SSE 格式，data: {...} + [DONE] 结束标记
-//  - 响应：choices[0].message.content + usage.prompt_tokens / completion_tokens
+//   - baseURL 官方示例：https://ark.cn-beijing.volces.com/api/v3
+//   - 请求路径：POST /chat/completions
+//   - 鉴权：Bearer {ARK_API_KEY}
+//   - 流式：SSE 格式，data: {...} + [DONE] 结束标记
+//   - 响应：choices[0].message.content + usage.prompt_tokens / completion_tokens
 //
 // 实现策略：结构对齐 OpenAI Provider——ChatCompletion 非流式 + ChatCompletionStream 流式 SSE + Name；
 // Embedding / Moderation / Cost 返回 ErrNotImplemented。
@@ -29,18 +29,17 @@ import (
 type Provider struct {
 	baseURL string
 	apiKey  string
-	client  *http.Client
+	clients *provider.Clients
 }
 
 // New 创建火山方舟 Provider
 // baseURL 官方默认：https://ark.cn-beijing.volces.com/api/v3
-func New(baseURL, apiKey string) *Provider {
+// clients 由 main 启动时统一构造注入（非流式带 attempt 总超时，流式无总超时）
+func New(baseURL, apiKey string, clients *provider.Clients) *Provider {
 	return &Provider{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
-		client: &http.Client{
-			Timeout: 120 * time.Second,
-		},
+		clients: clients,
 	}
 }
 
@@ -49,14 +48,19 @@ func (p *Provider) Name() string {
 	return "volcengine"
 }
 
+// BaseURL 上游端点（熔断 key 用）
+func (p *Provider) BaseURL() string {
+	return p.baseURL
+}
+
 // --- 请求 / 响应结构（与 OpenAI 协议对齐） ---
 
 type volcRequest struct {
-	Model       string             `json:"model"`
-	Messages    []volcMessage      `json:"messages"`
-	Temperature *float32           `json:"temperature,omitempty"`
-	MaxTokens   *int               `json:"max_tokens,omitempty"`
-	Stream      bool               `json:"stream"`
+	Model       string        `json:"model"`
+	Messages    []volcMessage `json:"messages"`
+	Temperature *float32      `json:"temperature,omitempty"`
+	MaxTokens   *int          `json:"max_tokens,omitempty"`
+	Stream      bool          `json:"stream"`
 }
 
 type volcMessage struct {
@@ -132,32 +136,32 @@ func (p *Provider) ChatCompletion(ctx context.Context, req *provider.ChatRequest
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 
-	resp, err := p.client.Do(httpReq)
+	resp, err := p.clients.NonStream.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("volcengine: http call failed: %w", err)
+		return nil, provider.NewNetworkError(p.Name(), err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("volcengine: read response body: %w", err)
+		return nil, provider.NewNetworkError(p.Name(), err)
 	}
 
 	if resp.StatusCode >= 400 {
 		var errResp volcErrorResponse
 		if e := json.Unmarshal(respBody, &errResp); e == nil && errResp.Error.Message != "" {
-			return nil, fmt.Errorf("volcengine: upstream error [%d] %s", errResp.Error.Code, errResp.Error.Message)
+			return nil, provider.NewUpstreamError(p.Name(), resp.StatusCode, errResp.Error.Type, errResp.Error.Message)
 		}
-		return nil, fmt.Errorf("volcengine: upstream returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, provider.NewUpstreamError(p.Name(), resp.StatusCode, "http_error", string(respBody))
 	}
 
 	var parsed volcResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, fmt.Errorf("volcengine: unmarshal response: %w", err)
+		return nil, provider.NewInvalidResponseError(p.Name(), resp.StatusCode, "unmarshal response: "+err.Error())
 	}
 
 	if len(parsed.Choices) == 0 {
-		return nil, fmt.Errorf("volcengine: empty choices in response")
+		return nil, provider.NewInvalidResponseError(p.Name(), resp.StatusCode, "empty choices in response")
 	}
 
 	result := &provider.ChatResponse{
@@ -215,9 +219,9 @@ func (p *Provider) ChatCompletionStream(ctx context.Context, req *provider.ChatR
 		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 		httpReq.Header.Set("Accept", "text/event-stream")
 
-		resp, err := p.client.Do(httpReq)
+		resp, err := p.clients.Stream.Do(httpReq)
 		if err != nil {
-			errs <- fmt.Errorf("volcengine stream: http call failed: %w", err)
+			errs <- provider.NewNetworkError(p.Name(), err)
 			return
 		}
 		defer resp.Body.Close()
@@ -226,9 +230,9 @@ func (p *Provider) ChatCompletionStream(ctx context.Context, req *provider.ChatR
 			respBody, _ := io.ReadAll(resp.Body)
 			var errResp volcErrorResponse
 			if e := json.Unmarshal(respBody, &errResp); e == nil && errResp.Error.Message != "" {
-				errs <- fmt.Errorf("volcengine stream: upstream error [%d] %s", errResp.Error.Code, errResp.Error.Message)
+				errs <- provider.NewUpstreamError(p.Name(), resp.StatusCode, errResp.Error.Type, errResp.Error.Message)
 			} else {
-				errs <- fmt.Errorf("volcengine stream: upstream returned status %d", resp.StatusCode)
+				errs <- provider.NewUpstreamError(p.Name(), resp.StatusCode, "http_error", string(respBody))
 			}
 			return
 		}
@@ -283,7 +287,7 @@ func (p *Provider) ChatCompletionStream(ctx context.Context, req *provider.ChatR
 		}
 
 		if err := scanner.Err(); err != nil {
-			errs <- fmt.Errorf("volcengine stream: scanner error: %w", err)
+			errs <- provider.NewNetworkError(p.Name(), err)
 		}
 	}()
 

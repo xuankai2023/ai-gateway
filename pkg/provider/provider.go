@@ -95,3 +95,9 @@ type StreamChunk struct {
 type Streamer interface {
 	ChatCompletionStream(ctx context.Context, req *ChatRequest) (chunkChan <-chan StreamChunk, errChan <-chan error)
 }
+
+// Endpoint 可选扩展接口：暴露上游 base_url
+// 熔断 key = provider type + base_url，同一类型的不同端点互不影响
+type Endpoint interface {
+	BaseURL() string
+}

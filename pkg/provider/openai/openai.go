@@ -22,17 +22,16 @@ import (
 type Provider struct {
 	baseURL string
 	apiKey  string
-	client  *http.Client
+	clients *provider.Clients
 }
 
 // New 创建 OpenAI 兼容 Provider
-func New(baseURL, apiKey string) *Provider {
+// clients 由 main 启动时统一构造注入（非流式带 attempt 总超时，流式无总超时）
+func New(baseURL, apiKey string, clients *provider.Clients) *Provider {
 	return &Provider{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
-		client: &http.Client{
-			Timeout: 120 * time.Second,
-		},
+		clients: clients,
 	}
 }
 
@@ -41,15 +40,20 @@ func (p *Provider) Name() string {
 	return "openai"
 }
 
+// BaseURL 上游端点（熔断 key 用）
+func (p *Provider) BaseURL() string {
+	return p.baseURL
+}
+
 // --- ChatCompletion 非流式 ---
 
 // openaiRequest OpenAI /chat/completions 请求体（只包含当前阶段用到的字段）
 type openaiRequest struct {
-	Model       string         `json:"model"`
+	Model       string          `json:"model"`
 	Messages    []openaiMessage `json:"messages"`
-	Temperature *float32       `json:"temperature,omitempty"`
-	MaxTokens   *int           `json:"max_tokens,omitempty"`
-	Stream      bool           `json:"stream"`
+	Temperature *float32        `json:"temperature,omitempty"`
+	MaxTokens   *int            `json:"max_tokens,omitempty"`
+	Stream      bool            `json:"stream"`
 }
 
 type openaiMessage struct {
@@ -113,34 +117,34 @@ func (p *Provider) ChatCompletion(ctx context.Context, req *provider.ChatRequest
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 
-	resp, err := p.client.Do(httpReq)
+	resp, err := p.clients.NonStream.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("openai: http call failed: %w", err)
+		return nil, provider.NewNetworkError(p.Name(), err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("openai: read response body: %w", err)
+		return nil, provider.NewNetworkError(p.Name(), err)
 	}
 
 	// 3. 错误处理
 	if resp.StatusCode >= 400 {
 		var errResp openaiErrorResponse
 		if e := json.Unmarshal(respBody, &errResp); e == nil && errResp.Error.Message != "" {
-			return nil, fmt.Errorf("openai: upstream error [%s] %s", errResp.Error.Type, errResp.Error.Message)
+			return nil, provider.NewUpstreamError(p.Name(), resp.StatusCode, errResp.Error.Type, errResp.Error.Message)
 		}
-		return nil, fmt.Errorf("openai: upstream returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, provider.NewUpstreamError(p.Name(), resp.StatusCode, "http_error", string(respBody))
 	}
 
 	// 4. 解析成功响应
 	var parsed openaiResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, fmt.Errorf("openai: unmarshal response: %w", err)
+		return nil, provider.NewInvalidResponseError(p.Name(), resp.StatusCode, "unmarshal response: "+err.Error())
 	}
 
 	if len(parsed.Choices) == 0 {
-		return nil, fmt.Errorf("openai: empty choices in response")
+		return nil, provider.NewInvalidResponseError(p.Name(), resp.StatusCode, "empty choices in response")
 	}
 
 	result := &provider.ChatResponse{
@@ -217,9 +221,9 @@ func (p *Provider) ChatCompletionStream(ctx context.Context, req *provider.ChatR
 		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 		httpReq.Header.Set("Accept", "text/event-stream")
 
-		resp, err := p.client.Do(httpReq)
+		resp, err := p.clients.Stream.Do(httpReq)
 		if err != nil {
-			errs <- fmt.Errorf("openai stream: http call failed: %w", err)
+			errs <- provider.NewNetworkError(p.Name(), err)
 			return
 		}
 		defer resp.Body.Close()
@@ -229,9 +233,9 @@ func (p *Provider) ChatCompletionStream(ctx context.Context, req *provider.ChatR
 			respBody, _ := io.ReadAll(resp.Body)
 			var errResp openaiErrorResponse
 			if e := json.Unmarshal(respBody, &errResp); e == nil && errResp.Error.Message != "" {
-				errs <- fmt.Errorf("openai stream: upstream error [%s] %s", errResp.Error.Type, errResp.Error.Message)
+				errs <- provider.NewUpstreamError(p.Name(), resp.StatusCode, errResp.Error.Type, errResp.Error.Message)
 			} else {
-				errs <- fmt.Errorf("openai stream: upstream returned status %d", resp.StatusCode)
+				errs <- provider.NewUpstreamError(p.Name(), resp.StatusCode, "http_error", string(respBody))
 			}
 			return
 		}
@@ -298,7 +302,7 @@ func (p *Provider) ChatCompletionStream(ctx context.Context, req *provider.ChatR
 
 		// Scanner 错误（可能是上游断了或网络问题）
 		if err := scanner.Err(); err != nil {
-			errs <- fmt.Errorf("openai stream: scanner error: %w", err)
+			errs <- provider.NewNetworkError(p.Name(), err)
 		}
 	}()
 
