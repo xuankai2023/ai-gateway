@@ -1,22 +1,35 @@
 # Go
-*.exe *.dll *.so *.dylib
+*.exe
+*.dll
+*.so
+*.dylib
 vendor/
 
 # Python
-__pycache__/ *.pyc .venv/
+__pycache__/
+*.pyc
+.venv/
 
 # Node
-node_modules/ .next/
+node_modules/
+.next/
+*.tsbuildinfo
 
-# Config（不要把真实密钥提交）
+# 配置（不要把真实密钥提交）
 **/config.yaml
 **/.env
 **/.env.local
 .env*
 !.env.example
 
-# IDE
-.idea/ .vscode/ *.swp
+# IDE / Agent
+.idea/
+.vscode/
+.trae/
+*.swp
 
 # OS
 .DS_Store
+
+# 本地构建产物 / 下载的二进制
+/k6
