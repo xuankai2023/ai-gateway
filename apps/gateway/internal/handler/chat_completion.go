@@ -1,42 +1,40 @@
 // Package handler AI 请求处理器
 //
-// ChatCompletion 链路（改造后：abilities 优先 + retry 循环 + models 表 fallback）：
+// ChatCompletion 链路：
 //
 //	gin 路由 → Auth 中间件塞 tenant_id → Handler 解析请求
-//	→ resolveAbilitiesDB（倒排索引）
-//	    找到渠道 → retry 循环（retry 复用 = 换渠道 + 降级）
-//	        每轮 retry 同时是优先级下标 → tiers[retry]
-//	        WeightedPick 选渠道 → Factory.Get → 调上游
-//	        失败 → DecideRelayRetry + AsyncDisableChannel → 下一轮
-//	    全失败 → 返回最后一次错误
-//	→ 找不到渠道 → resolveModel（正排 models 表 fallback，保证 P0 向后兼容）
-//	→ 非流式：ChatCompletion → 算 cost → 写 usage_logs → 返回
-//	→ 流式：ChatCompletionStream → 逐帧 SSE 写客户端 → 累积 usage → 算 cost → 写 usage_logs
+//	→ App.Resolver.ResolveAttempts（abilities 倒排索引优先，models 表兜底）
+//	→ App.Relay.NonStream / App.Relay.Stream 逐渠道尝试（熔断 + 重试决策在 relay 内）
+//	→ Handler 只做响应编解码、usage_logs 与指标输出
+//
+// 阶段 14：handler 改为 func(app *app.App) gin.HandlerFunc 形式，
+// 路由解析接口注入（测试可替换 fake），不再引用任何包级全局态。
 package handler
 
 import (
 	"context"
-	"crypto/rand"
-	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"time"
 
+	"ai-gateway/apps/gateway/internal/app"
+	"ai-gateway/apps/gateway/internal/diagnostics"
 	"ai-gateway/apps/gateway/internal/middleware"
+	"ai-gateway/apps/gateway/internal/rag"
+	"ai-gateway/apps/gateway/internal/relay"
 	"ai-gateway/apps/gateway/internal/routing"
-	"ai-gateway/pkg/circuitbreaker"
-	"ai-gateway/pkg/db"
+	"ai-gateway/apps/gateway/internal/usagelog"
+	"ai-gateway/pkg/apperr"
+	"ai-gateway/pkg/ledger"
 	"ai-gateway/pkg/observability"
+	"ai-gateway/pkg/pricing"
 	"ai-gateway/pkg/provider"
+	"ai-gateway/pkg/requestid"
 	"github.com/gin-gonic/gin"
-)
-
-const (
-	// maxRetryPerRequest 单次请求最大重试次数（= abilities 层数，try all tiers）
-	maxRetryPerRequest = 4
+	"go.uber.org/zap"
 )
 
 // chatCompletionRequest OpenAI 兼容请求体
@@ -53,110 +51,210 @@ type message struct {
 	Content string `json:"content" binding:"required"`
 }
 
-// modelRoute 模型路由解析结果（fallback 用：models 表单渠道）
-type modelRoute struct {
-	providerType  string
-	providerModel string
-	inputPrice1k  float64
-	outputPrice1k float64
+// defaultStreamMaxDuration 流式转发总时长兜底默认值（与 pkg/config 默认一致）
+const defaultStreamMaxDuration = 300 * time.Second
+
+// 请求校验硬上限（阶段 5）：非法请求在 relay 之前早拦，不消耗渠道与上游配额。
+// 总请求体尺寸由全局 bodyLimit（MaxBytesReader）统一兜底，此处不重复检查。
+const (
+	maxMessages    = 100       // messages 条数上限
+	maxContentSize = 512 << 10 // 单条 content ≤ 512KB
+)
+
+// modelNamePattern 模型名白名单字符集（1~128 字符）
+var modelNamePattern = regexp.MustCompile(`^[a-zA-Z0-9._:/-]{1,128}$`)
+
+// validationError 请求校验错误（code 对外暴露，msg 进 error.message）
+type validationError struct {
+	code string
+	msg  string
 }
 
-// ---- 测试注入点 ----
+func (e *validationError) Error() string { return e.msg }
 
-var resolveModelFn = resolveModel
+// validateChatRequest 请求体加固校验；通过返回 nil
+func validateChatRequest(req *chatCompletionRequest) *validationError {
+	if !modelNamePattern.MatchString(req.Model) {
+		return &validationError{"invalid_model", "invalid model name"}
+	}
+	if len(req.Messages) > maxMessages {
+		return &validationError{"too_many_messages",
+			fmt.Sprintf("too many messages: %d (max %d)", len(req.Messages), maxMessages)}
+	}
+	for i := range req.Messages {
+		if len(req.Messages[i].Content) > maxContentSize {
+			return &validationError{"content_too_large",
+				fmt.Sprintf("messages[%d].content exceeds %d bytes", i, maxContentSize)}
+		}
+	}
+	return nil
+}
 
-// ---- Handler 入口 ----
+// requestScope 一次请求的上下文（收敛成结构体，避免长参数列表在收尾函数间层层透传）
+type requestScope struct {
+	TenantID       int64
+	APIKeyID       int64
+	ProjectID      int64
+	AssistantID    int64
+	Model          string // 客户端请求模型（响应回填用）
+	RouteModel     string // 实际路由模型（灰度 / 渠道映射）
+	RetrievedCount int
+	RetrievalMs    int64
+	Citations      []rag.Citation
+}
 
-// ChatCompletion Handler 入口（改造后：abilities 优先 + retry 循环 + models 表 fallback）
-func ChatCompletion() gin.HandlerFunc {
+// ChatCompletion Handler 入口（阶段 14：func(app) 形式）
+// 阶段 15：maxAttempts / streamMaxDuration 每请求读取 a.Hot 热更新值（不重进程生效）；
+// a.Hot 缺失或零值时回落静态配置，streamMaxDuration 再回落内置兜底
+func ChatCompletion(a *app.App) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		maxAttempts := 0
+		streamMaxDuration := time.Duration(0)
+		if a.Hot != nil {
+			maxAttempts = a.Hot.MaxAttempts()
+			streamMaxDuration = a.Hot.StreamMaxDuration()
+		}
+		if maxAttempts <= 0 && a.Config != nil {
+			maxAttempts = a.Config.Gateway.MaxAttempts
+		}
+		if streamMaxDuration <= 0 && a.Config != nil {
+			_, _, streamMaxDuration = a.Config.Gateway.TimeoutDurations()
+		}
+		if streamMaxDuration <= 0 {
+			streamMaxDuration = defaultStreamMaxDuration
+		}
 		start := time.Now()
 
 		// 1. auth 检查
 		raw, exists := c.Get("tenant_id")
 		tenantID, ok := raw.(int64)
 		if !exists || !ok {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": gin.H{"message": "unauthorized", "type": "authentication_error"},
-			})
+			apperr.Write(c, http.StatusUnauthorized, "authentication_error", "unauthorized", "unauthorized")
 			return
 		}
 		raw, exists = c.Get("api_key_id")
 		apiKeyID, ok := raw.(int64)
 		if !exists || !ok {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": gin.H{"message": "unauthorized", "type": "authentication_error"},
-			})
+			apperr.Write(c, http.StatusUnauthorized, "authentication_error", "unauthorized", "unauthorized")
 			return
 		}
 
 		// 2. 解析请求体
 		var req chatCompletionRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": gin.H{"message": "invalid request body: " + err.Error(), "type": "invalid_request_error"},
-			})
+			apperr.Write(c, http.StatusBadRequest, "invalid_request_error", "invalid_request_body", "invalid request body: "+err.Error())
 			return
 		}
 
-		// 3. abilities 倒排索引优先查询
-		tiers, abilitiesFound, err := routing.ResolveAbilities(c.Request.Context(), tenantID, req.Model)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": gin.H{"message": "routing error: " + err.Error(), "type": "internal_error"},
-			})
+		// 2.1 请求校验加固（条数 / 单条尺寸 / 模型名字符集）
+		if verr := validateChatRequest(&req); verr != nil {
+			apperr.Write(c, http.StatusBadRequest, "invalid_request_error", verr.code, verr.msg)
 			return
 		}
 
-		if abilitiesFound && len(tiers) > 0 {
-			// ✅ 有 abilities：走 retry 循环
-			if req.Stream {
-				handleStreamWithRetry(c, tiers, req, tenantID, apiKeyID, start)
-			} else {
-				handleNonStreamWithRetry(c, tiers, req, tenantID, apiKeyID, start)
+		// 3. 助手解析（对外模型名 → 项目）：命中后强制校验 API Key 所属项目
+		//    项目归属只信认证中间件注入的 project_id，绝不从请求体读取
+		var asst *rag.Assistant
+		if a.RAG != nil {
+			resolved, err := a.RAG.ResolveAssistant(requestContext(c), tenantID, req.Model)
+			switch {
+			case err == nil:
+				asst = resolved
+			case errors.Is(err, rag.ErrAssistantNotFound):
+				// 普通模型：继续走现有渠道路由
+			case errors.Is(err, rag.ErrProjectInactive):
+				apperr.Write(c, http.StatusForbidden, "permission_error", "project_disabled", "project disabled")
+				return
+			default:
+				// 检索配置异常不阻断对话：降级为普通模型
+				observability.L().Warn("rag: resolve assistant failed, fallback to plain model",
+					zap.String("model", req.Model), zap.Error(err))
 			}
-			return
+		}
+		projectID := c.GetInt64("project_id")
+		if asst != nil {
+			if projectID <= 0 {
+				apperr.Write(c, http.StatusForbidden, "permission_error", "project_required",
+					fmt.Sprintf("model %q requires an API key bound to a project", req.Model))
+				return
+			}
+			if projectID != asst.ProjectID {
+				apperr.Write(c, http.StatusForbidden, "permission_error", "project_scope_mismatch",
+					fmt.Sprintf("model %q belongs to another project", req.Model))
+				return
+			}
 		}
 
-		// 🔄 fallback：abilities 没数据（或全禁用）→ 老的 models 表单渠道
-		route, err := resolveModelFn(c.Request.Context(), tenantID, req.Model)
+		// 4. 解析候选计划（灰度中间件命中时按 target_model 路由，响应仍回填客户端请求模型）
+		routeModel := req.Model
+		if v, ok := c.Get("target_model"); ok {
+			if tm, ok := v.(string); ok && tm != "" {
+				routeModel = tm
+			}
+		}
+		attempts, err := a.Resolver.ResolveAttempts(requestContext(c), tenantID, routeModel, maxAttempts)
 		if err != nil {
-			status := http.StatusBadRequest
-			if errors.Is(err, ErrModelNotFound) {
+			status := http.StatusInternalServerError
+			errType := "internal_error"
+			code := "routing_error"
+			switch {
+			case errors.Is(err, relay.ErrModelNotFound):
 				status = http.StatusNotFound
+				errType = "model_error"
+				code = "model_not_found"
+			case errors.Is(err, routing.ErrNoAvailableChannel):
+				status = http.StatusBadGateway
+				errType = "upstream_error"
+				code = "no_available_channel"
 			}
-			c.JSON(status, gin.H{
-				"error": gin.H{"message": err.Error(), "type": "model_error"},
-			})
+			apperr.Write(c, status, errType, code, err.Error())
 			return
 		}
 
-		p, err := provider.Factory.Get(route.providerType)
-		if err != nil {
-			logAndRecord(c, tenantID, apiKeyID, req.Model, route.providerType,
-				0, 0, 0, "error", "provider not registered: "+route.providerType, start)
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": gin.H{"message": "provider not registered: " + route.providerType, "type": "config_error"},
-			})
-			return
+		// 5. RAG 检索拼装（命中助手时）：失败 / 超时降级为无资料回答，不影响 relay
+		scope := requestScope{
+			TenantID: tenantID, APIKeyID: apiKeyID, ProjectID: projectID,
+			Model: req.Model, RouteModel: routeModel,
+		}
+		creq := buildChatRequest(req)
+		if asst != nil {
+			scope.AssistantID = asst.ID
+			rc, ragErr := a.RAG.Assemble(requestContext(c), asst, creq.Messages)
+			if ragErr != nil {
+				observability.L().Warn("rag: assemble failed, fallback to no-context",
+					zap.Int64("project_id", asst.ProjectID), zap.Error(ragErr))
+			}
+			if rc != nil {
+				creq.Messages = rc.Messages
+				scope.Citations = rc.Citations
+				scope.RetrievedCount = rc.RetrievedCount
+				scope.RetrievalMs = rc.Elapsed.Milliseconds()
+			}
 		}
 
-		creq := buildChatRequest(route.providerModel, req)
-
+		// 6. 非流式 / 流式统一走 relay
 		if req.Stream {
-			handleStream(c, p, creq, tenantID, apiKeyID, req.Model, route.providerType,
-				route.inputPrice1k, route.outputPrice1k, start)
+			runStream(c, a, attempts, creq, scope, start, streamMaxDuration)
 		} else {
-			handleNonStream(c, p, creq, tenantID, apiKeyID, req.Model, route.providerType,
-				route.inputPrice1k, route.outputPrice1k, start)
+			runNonStream(c, a, attempts, creq, scope, start)
 		}
 	}
 }
 
-// buildChatRequest 构造平台中立请求
-func buildChatRequest(providerModel string, req chatCompletionRequest) *provider.ChatRequest {
+// requestContext 取中间件注入的 otel_ctx（span 上下文），缺失时退回请求原始 context
+func requestContext(c *gin.Context) context.Context {
+	if v, ok := c.Get("otel_ctx"); ok {
+		if ctx, ok := v.(context.Context); ok {
+			return ctx
+		}
+	}
+	return c.Request.Context()
+}
+
+// buildChatRequest 构造平台中立请求（model 由 relay 按渠道替换）
+func buildChatRequest(req chatCompletionRequest) *provider.ChatRequest {
 	creq := &provider.ChatRequest{
-		Model: providerModel,
+		Model: req.Model,
 	}
 	for _, m := range req.Messages {
 		creq.Messages = append(creq.Messages, provider.Message{Role: m.Role, Content: m.Content})
@@ -170,166 +268,52 @@ func buildChatRequest(providerModel string, req chatCompletionRequest) *provider
 	return creq
 }
 
-// --- retry 循环（非流式） ---
+// runNonStream 非流式调用 + 结果输出
+func runNonStream(c *gin.Context, a *app.App, attempts []routing.Ability,
+	creq *provider.ChatRequest, scope requestScope, start time.Time) {
 
-func handleNonStreamWithRetry(c *gin.Context, tiers []routing.PriorityTier,
-	req chatCompletionRequest, tenantID, apiKeyID int64, start time.Time) {
-
-	maxRetry := min(maxRetryPerRequest, len(tiers))
-	var lastErr error
-	var lastAbility *routing.Ability
-
-	for retry := 0; retry < maxRetry; retry++ {
-		tier := tiers[retry]
-		picked := routing.WeightedPick(tier.Channels)
-		if picked == nil {
-			continue // 这层没可用渠道，跳过
-		}
-
-		lastAbility = picked
-		p, err := provider.Factory.Get(picked.Provider)
-		if err != nil {
-			lastErr = err
-			routing.AsyncDisableChannel(picked.ID)
-			continue
-		}
-
-		// 补充 span 属性：租户 + 模型 + 选中的渠道
-		middleware.AddRequestAttrs(c, tenantID, req.Model, picked.Provider)
-
-		creq := buildChatRequest(picked.ProviderModel, req)
-
-		// 🔴 CircuitBreaker：用 circuitbreaker.Call 包裹上游调用
-		// gobreaker 自动根据 callErr 是否为 nil 来更新熔断计数器
-		result, callErr := circuitbreaker.Call(picked.Provider, func() (interface{}, error) {
-			return p.ChatCompletion(c.Request.Context(), creq)
-		})
-
-		if callErr == nil {
-			// ✅ 成功：熔断器自动重置计数 + 用本渠道自己的价格算 cost
-			resp := result.(*provider.ChatResponse)
-			cost := calcCost(resp.InputTokens, resp.OutputTokens, picked.InputPrice1k, picked.OutputPrice1k)
-			logAndRecord(c, tenantID, apiKeyID, req.Model, picked.Provider,
-				resp.InputTokens, resp.OutputTokens, cost, "success", "", start)
-			c.JSON(http.StatusOK, openaiCompletionResponse(resp, req.Model))
-			return
-		}
-
-		// ❌ 失败：熔断器自动 +1 + 异步禁用渠道
-		lastErr = callErr
-		routing.AsyncDisableChannel(picked.ID)
-
-		decision := routing.DecideRelayRetry(callErr, retry, maxRetry)
-		if decision == routing.RetryStop {
-			break // 不可重试，直接退出循环返回错误
-		}
-		// RetryRetry → 自然进入下一轮（tiers[retry+1] 更低优先级）
+	res := a.Relay.NonStream(requestContext(c), attempts, creq)
+	if res.Err != nil {
+		logExhausted(c, a, scope, res.Attempt.Provider, res.Attempts, res.Err, start)
+		recordDiagnostics(c, a, scope, false, creq, res, exhaustedStatus(res.Err), res.Err, 0, start)
+		return
 	}
 
-	// 所有层都失败
-	providerType := "unknown"
-	if lastAbility != nil {
-		providerType = lastAbility.Provider
-	}
-	logAndRecord(c, tenantID, apiKeyID, req.Model, providerType,
-		0, 0, 0, "error", fmt.Sprintf("all %d tiers exhausted: %v", maxRetry, lastErr), start)
-	c.JSON(http.StatusBadGateway, gin.H{
-		"error": gin.H{"message": "all upstream providers exhausted", "type": "upstream_error"},
-	})
+	attempt, resp := res.Attempt, res.Response
+	middleware.AddRequestAttrs(c, scope.TenantID, scope.Model, attempt.Provider)
+
+	cost, priceVersion := settleCost(c, a, scope.TenantID, scope.RouteModel, attempt, resp.InputTokens, resp.OutputTokens)
+	c.Set("ledger_final_cost", int64(cost))
+	logAndRecord(c, a, scope, attempt.Provider,
+		resp.InputTokens, resp.OutputTokens, cost, priceVersion, "success", "", start)
+	recordDiagnostics(c, a, scope, false, creq, res, http.StatusOK, nil, int64(cost), start)
+	c.JSON(http.StatusOK, openaiCompletionResponse(resp, scope.Model, scope.Citations))
 }
 
-// --- retry 循环（流式） ---
+// runStream 流式调用 + SSE 输出
+func runStream(c *gin.Context, a *app.App, attempts []routing.Ability,
+	creq *provider.ChatRequest, scope requestScope, start time.Time, streamMaxDuration time.Duration) {
 
-// 流式 retry 规则：只尝试"上游初始连接阶段"的重试。
-// HTTP 200 + SSE headers 已经发出后，不再 retry（客户端已经看到流式了，不能回头）。
-// 如果上游在初始连接阶段（还没返回第一个 chunk）就报错 → 立刻切下一个渠道。
-
-func handleStreamWithRetry(c *gin.Context, tiers []routing.PriorityTier,
-	req chatCompletionRequest, tenantID, apiKeyID int64, start time.Time) {
-
-	maxRetry := min(maxRetryPerRequest, len(tiers))
-	var lastErr error
-	var lastAbility *routing.Ability
-
-	for retry := 0; retry < maxRetry; retry++ {
-		tier := tiers[retry]
-		picked := routing.WeightedPick(tier.Channels)
-		if picked == nil {
-			continue
+	res := a.Relay.Stream(requestContext(c), attempts, creq)
+	if res.Err != nil {
+		if errors.Is(res.Err, context.Canceled) {
+			return // 客户端已断开，静默退出
 		}
-
-		lastAbility = picked
-		p, err := provider.Factory.Get(picked.Provider)
-		if err != nil {
-			lastErr = err
-			routing.AsyncDisableChannel(picked.ID)
-			continue
-		}
-
-		streamer, ok := p.(provider.Streamer)
-		if !ok {
-			routing.AsyncDisableChannel(picked.ID)
-			continue // 这个 provider 不支持流式，跳过
-		}
-
-		creq := buildChatRequest(picked.ProviderModel, req)
-		chunkChan, errChan := streamer.ChatCompletionStream(c.Request.Context(), creq)
-
-		// 尝试读取第一个 chunk 来判断上游连接是否成功
-		select {
-		case firstChunk, ok := <-chunkChan:
-			if !ok {
-				// 上游直接失败
-				streamErr, _ := <-errChan
-				if streamErr == nil {
-					streamErr = errors.New("stream closed without first chunk")
-				}
-				lastErr = streamErr
-				routing.AsyncDisableChannel(picked.ID)
-				decision := routing.DecideRelayRetry(streamErr, retry, maxRetry)
-				if decision == routing.RetryStop {
-					goto STREAM_FAIL
-				}
-				continue // try next tier
-			}
-			// 🔑 上游连接成功，开始 SSE 转发——不再 retry
-			handleStreamConnected(c, chunkChan, errChan, firstChunk,
-				picked, req, tenantID, apiKeyID, start)
-			return
-
-		case streamErr, ok := <-errChan:
-			if ok && streamErr != nil {
-				lastErr = streamErr
-				routing.AsyncDisableChannel(picked.ID)
-				decision := routing.DecideRelayRetry(streamErr, retry, maxRetry)
-				if decision == routing.RetryStop {
-					goto STREAM_FAIL
-				}
-				continue // try next tier
-			}
-
-		case <-c.Request.Context().Done():
-			goto STREAM_FAIL
-		}
+		logExhausted(c, a, scope, res.Attempt.Provider, res.Attempts, res.Err, start)
+		recordDiagnostics(c, a, scope, true, creq, res, exhaustedStatus(res.Err), res.Err, 0, start)
+		return
 	}
+	defer res.Close()
 
-STREAM_FAIL:
-	providerType := "unknown"
-	if lastAbility != nil {
-		providerType = lastAbility.Provider
-	}
-	logAndRecord(c, tenantID, apiKeyID, req.Model, providerType,
-		0, 0, 0, "error", fmt.Sprintf("all %d tiers exhausted: %v", maxRetry, lastErr), start)
-	c.JSON(http.StatusBadGateway, gin.H{
-		"error": gin.H{"message": "all upstream providers exhausted", "type": "upstream_error"},
-	})
+	middleware.AddRequestAttrs(c, scope.TenantID, scope.Model, res.Attempt.Provider)
+	handleStreamConnected(c, a, creq, res, scope, start, streamMaxDuration)
 }
 
-// handleStreamConnected 上游连接成功后的 SSE 转发（不会 retry）
-func handleStreamConnected(c *gin.Context, chunkChan <-chan provider.StreamChunk,
-	errChan <-chan error, firstChunk provider.StreamChunk,
-	picked *routing.Ability, req chatCompletionRequest,
-	tenantID, apiKeyID int64, start time.Time) {
+// handleStreamConnected 上游连接成功后的 SSE 转发
+// streamMaxDuration 是转发总时长兜底：超时按流式错误收尾（错误帧 + [DONE]），
+// 防上游半死连接把转发 goroutine 与连接永久挂住
+func handleStreamConnected(c *gin.Context, a *app.App, creq *provider.ChatRequest,
+	res *relay.Result, scope requestScope, start time.Time, streamMaxDuration time.Duration) {
 
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -338,9 +322,7 @@ func handleStreamConnected(c *gin.Context, chunkChan <-chan provider.StreamChunk
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": gin.H{"message": "streaming not supported", "type": "internal_error"},
-		})
+		apperr.Write(c, http.StatusInternalServerError, "internal_error", "stream_unsupported", "streaming not supported")
 		return
 	}
 
@@ -348,22 +330,27 @@ func handleStreamConnected(c *gin.Context, chunkChan <-chan provider.StreamChunk
 	created := time.Now().Unix()
 
 	// 发第一个 chunk
-	fmt.Fprintf(c.Writer, "data: %s\n\n", buildStreamFrame(respID, created, req.Model, firstChunk))
+	fmt.Fprintf(c.Writer, "data: %s\n\n", buildStreamFrame(respID, created, scope.Model, res.FirstChunk, scope.Citations))
 	flusher.Flush()
 
 	var finalInputTokens, finalOutputTokens int64
 	var streamErr error
 	var doneSent bool
 
-	if firstChunk.IsDone {
-		finalInputTokens = firstChunk.InputTokens
-		finalOutputTokens = firstChunk.OutputTokens
+	// 转发总时长兜底：中间件的 stream_max_duration ctx 是第一道防线，
+	// 本定时器从转发起算独立计时，双重保险防挂死
+	maxTimer := time.NewTimer(streamMaxDuration)
+	defer maxTimer.Stop()
+
+	if res.FirstChunk.IsDone {
+		finalInputTokens = res.FirstChunk.InputTokens
+		finalOutputTokens = res.FirstChunk.OutputTokens
 		goto STREAM_END
 	}
 
 	for {
 		select {
-		case chunk, ok := <-chunkChan:
+		case chunk, ok := <-res.Chunks:
 			if !ok {
 				goto STREAM_END
 			}
@@ -371,17 +358,27 @@ func handleStreamConnected(c *gin.Context, chunkChan <-chan provider.StreamChunk
 				finalInputTokens = chunk.InputTokens
 				finalOutputTokens = chunk.OutputTokens
 			}
-			fmt.Fprintf(c.Writer, "data: %s\n\n", buildStreamFrame(respID, created, req.Model, chunk))
+			fmt.Fprintf(c.Writer, "data: %s\n\n", buildStreamFrame(respID, created, scope.Model, chunk, scope.Citations))
 			flusher.Flush()
 
-		case err, ok := <-errChan:
+		case err, ok := <-res.Errs:
 			if ok && err != nil {
 				streamErr = err
-				fmt.Fprintf(c.Writer, "data: %s\n\n", `{"error":{"message":"upstream provider error","type":"upstream_error"}}`)
+				errBody, _ := json.Marshal(apperr.Body(c, "upstream_error", "stream_upstream_error", "upstream provider error"))
+				fmt.Fprintf(c.Writer, "data: %s\n\n", errBody)
 				fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
 				flusher.Flush()
 				doneSent = true
 			}
+			goto STREAM_END
+
+		case <-maxTimer.C:
+			streamErr = errStreamMaxDuration
+			errBody, _ := json.Marshal(apperr.Body(c, "upstream_error", "stream_max_duration_exceeded", "stream max duration exceeded"))
+			fmt.Fprintf(c.Writer, "data: %s\n\n", errBody)
+			fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+			flusher.Flush()
+			doneSent = true
 			goto STREAM_END
 
 		case <-c.Request.Context().Done():
@@ -401,190 +398,199 @@ STREAM_END:
 		status = "error"
 		errMsg = streamErr.Error()
 	}
-	cost := calcCost(finalInputTokens, finalOutputTokens, picked.InputPrice1k, picked.OutputPrice1k)
-	logAndRecord(c, tenantID, apiKeyID, req.Model, picked.Provider,
-		finalInputTokens, finalOutputTokens, cost, status, errMsg, start)
+	cost, priceVersion := settleCost(c, a, scope.TenantID, scope.RouteModel, res.Attempt, finalInputTokens, finalOutputTokens)
+	c.Set("ledger_final_cost", int64(cost))
+	logAndRecord(c, a, scope, res.Attempt.Provider,
+		finalInputTokens, finalOutputTokens, cost, priceVersion, status, errMsg, start)
+	// 诊断快照：流式在收尾时落库（status_code 恒 200——SSE 头已发出，错误经错误帧传递）
+	recordDiagnostics(c, a, scope, true, creq, res, http.StatusOK, streamErr, int64(cost), start)
 }
 
-// --- fallback handlers（models 表单渠道，单调用） ---
+// errStreamMaxDuration 流式转发总时长兜底触发
+var errStreamMaxDuration = errors.New("stream max duration exceeded")
 
-// handleNonStream 非流式处理（fallback：models 表单渠道）
-func handleNonStream(c *gin.Context, p provider.Provider, creq *provider.ChatRequest,
-	tenantID, apiKeyID int64, modelAlias, providerType string,
-	inputPrice1k, outputPrice1k float64, start time.Time) {
-
-	resp, err := p.ChatCompletion(c.Request.Context(), creq)
-	if err != nil {
-		logAndRecord(c, tenantID, apiKeyID, modelAlias, providerType,
-			0, 0, 0, "error", err.Error(), start)
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error": gin.H{"message": "upstream provider error", "type": "upstream_error"},
-		})
-		return
+// exhaustedStatus 全部渠道耗尽时的对外状态码（与 logExhausted 的映射一致）
+func exhaustedStatus(lastErr error) int {
+	var upstreamErr *provider.UpstreamError
+	if errors.As(lastErr, &upstreamErr) && upstreamErr.Kind == provider.KindTimeout {
+		return http.StatusGatewayTimeout
 	}
-
-	cost := calcCost(resp.InputTokens, resp.OutputTokens, inputPrice1k, outputPrice1k)
-	logAndRecord(c, tenantID, apiKeyID, modelAlias, providerType,
-		resp.InputTokens, resp.OutputTokens, cost, "success", "", start)
-	c.JSON(http.StatusOK, openaiCompletionResponse(resp, modelAlias))
+	return http.StatusBadGateway
 }
 
-// handleStream 流式处理（fallback：models 表单渠道）
-func handleStream(c *gin.Context, p provider.Provider, creq *provider.ChatRequest,
-	tenantID, apiKeyID int64, modelAlias, providerType string,
-	inputPrice1k, outputPrice1k float64, start time.Time) {
+// recordDiagnostics 请求级诊断包落库（采样 / 异步 / 脱敏在 Recorder 内完成）。
+// trace_id 由 Trace 中间件注入；request_digest 只存请求体重序列化后的 BodyDigest
+// 输出（len + sha256 前缀），不落明文。
+func recordDiagnostics(c *gin.Context, a *app.App, scope requestScope, stream bool,
+	creq *provider.ChatRequest, res *relay.Result, statusCode int, finalErr error,
+	costMicro int64, start time.Time) {
 
-	streamer, ok := p.(provider.Streamer)
-	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{"message": "provider does not support streaming", "type": "not_supported_error"},
-		})
+	if a.Diagnostics == nil || res == nil {
+		return
+	}
+	traceID := c.GetString("trace_id")
+	if traceID == "" {
 		return
 	}
 
-	chunkChan, errChan := streamer.ChatCompletionStream(c.Request.Context(), creq)
-
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-
-	flusher, ok := c.Writer.(http.Flusher)
-	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": gin.H{"message": "streaming not supported", "type": "internal_error"},
-		})
-		return
+	digest := ""
+	if body, err := json.Marshal(creq); err == nil {
+		digest = observability.BodyDigest(body)
 	}
 
-	var finalInputTokens, finalOutputTokens int64
-	var streamErr error
-	var doneSent bool
-	respID := "chatcmpl-" + time.Now().Format("20060102150405")
-	created := time.Now().Unix()
-
-	for {
-		select {
-		case chunk, ok := <-chunkChan:
-			if !ok {
-				goto FINISH
-			}
-			if chunk.IsDone {
-				finalInputTokens = chunk.InputTokens
-				finalOutputTokens = chunk.OutputTokens
-			}
-			frame := buildStreamFrame(respID, created, modelAlias, chunk)
-			fmt.Fprintf(c.Writer, "data: %s\n\n", frame)
-			flusher.Flush()
-
-		case err, ok := <-errChan:
-			if ok && err != nil {
-				streamErr = err
-				fmt.Fprintf(c.Writer, "data: %s\n\n", `{"error":{"message":"upstream provider error","type":"upstream_error"}}`)
-				fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
-				flusher.Flush()
-				doneSent = true
-			}
-			goto FINISH
-
-		case <-c.Request.Context().Done():
-			goto FINISH
+	rec := diagnostics.Record{
+		TraceID:       traceID,
+		TenantID:      scope.TenantID,
+		Model:         scope.Model,
+		Stream:        stream,
+		RequestDigest: digest,
+		Attempts:      res.AttemptsTrace,
+		StatusCode:    statusCode,
+		TotalCost:     costMicro,
+		DurationMs:    time.Since(start).Milliseconds(),
+	}
+	if finalErr != nil {
+		var upstreamErr *provider.UpstreamError
+		if errors.As(finalErr, &upstreamErr) {
+			rec.ErrorType = string(upstreamErr.Kind)
+		} else {
+			rec.ErrorType = string(provider.KindUnknown)
 		}
+		rec.ErrorMessage = finalErr.Error()
 	}
-
-FINISH:
-	if !doneSent {
-		fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
-		flusher.Flush()
-	}
-
-	status := "success"
-	errMsg := ""
-	if streamErr != nil {
-		status = "error"
-		errMsg = streamErr.Error()
-	}
-	cost := calcCost(finalInputTokens, finalOutputTokens, inputPrice1k, outputPrice1k)
-	logAndRecord(c, tenantID, apiKeyID, modelAlias, providerType,
-		finalInputTokens, finalOutputTokens, cost, status, errMsg, start)
+	a.Diagnostics.Record(rec)
 }
 
-// --- Routing wrapper + DB 操作 ---
-
-// ResolveAbilitiesSafe 路由层到 handler 的桥接
-func ResolveAbilitiesSafe(ctx context.Context, tenantID int64, modelName string) ([]routing.PriorityTier, bool, error) {
-	return routing.ResolveAbilities(ctx, tenantID, modelName)
-}
-var ErrModelNotFound = errors.New("model not found for this tenant")
-
-// resolveModel 查 models 表（fallback）
-func resolveModel(ctx context.Context, tenantID int64, modelName string) (*modelRoute, error) {
-	pool := db.GetPool()
-	if pool == nil {
-		return nil, errors.New("db pool not initialized")
+// logExhausted 所有渠道都失败后的统一收尾：写 usage_logs + 返回 502/504
+// 超时类失败（attempt/request 层超时切断）映射 504，其余上游失败映射 502
+func logExhausted(c *gin.Context, a *app.App, scope requestScope, providerType string,
+	attemptCount int, lastErr error, start time.Time) {
+	if providerType == "" {
+		providerType = "unknown"
 	}
+	logAndRecord(c, a, scope, providerType,
+		0, 0, 0, 0, "error", fmt.Sprintf("all %d attempts exhausted: %v", attemptCount, lastErr), start)
 
-	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	route := &modelRoute{}
-	err := pool.QueryRowContext(queryCtx, `
-		SELECT provider, provider_model, input_price_1k, output_price_1k
-		FROM models
-		WHERE tenant_id = ? AND model_name = ? AND is_active = 1
-	`, tenantID, modelName).Scan(&route.providerType, &route.providerModel,
-		&route.inputPrice1k, &route.outputPrice1k)
-
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrModelNotFound
-		}
-		return nil, fmt.Errorf("model resolve failed: %w", err)
+	var upstreamErr *provider.UpstreamError
+	if errors.As(lastErr, &upstreamErr) && upstreamErr.Kind == provider.KindTimeout {
+		apperr.Write(c, http.StatusGatewayTimeout, "upstream_error", "upstream_timeout", "upstream providers timed out")
+		return
 	}
-	return route, nil
+	apperr.Write(c, http.StatusBadGateway, "upstream_error", "upstream_exhausted", "all upstream providers exhausted")
 }
 
 // --- 计费 / 日志 ---
 
-// calcCost 计费公式
-func calcCost(inputTokens, outputTokens int64, inputPrice1k, outputPrice1k float64) float64 {
-	inputCost := float64(inputTokens) * inputPrice1k / 1000.0
-	outputCost := float64(outputTokens) * outputPrice1k / 1000.0
-	return inputCost + outputCost
+// settleCost 用定价引擎按上游真实 usage 结算（A8：全程使用同一价格版本快照）。
+//
+// models 表无记录（纯 abilities 渠道）时回退 abilities 上的线性单价。
+func settleCost(c *gin.Context, a *app.App, tenantID int64, modelName string,
+	attempt routing.Ability, inputTokens, outputTokens int64) (ledger.MicroUSD, int) {
+
+	engine := a.Pricing
+	if engine == nil {
+		engine = pricing.Default
+	}
+
+	// A8：优先复用 Ledger 中间件在预占时写入的同一份价格快照，避免请求中途改价
+	var row *pricing.ModelRow
+	if v, ok := c.Get("ledger_pricing_row"); ok {
+		row, _ = v.(*pricing.ModelRow)
+	}
+	if row == nil && a.PricingResolver != nil {
+		if resolved, err := a.PricingResolver.ResolveModelPricing(requestContext(c), tenantID, modelName); err == nil {
+			row = resolved
+		}
+	}
+	if row == nil {
+		row = &pricing.ModelRow{
+			Model:         modelName,
+			Provider:      attempt.Provider,
+			PricingModel:  pricing.PriceLinear,
+			InputPrice1k:  ledger.FromDollars(attempt.InputPrice1k),
+			OutputPrice1k: ledger.FromDollars(attempt.OutputPrice1k),
+			PriceVersion:  1,
+		}
+	}
+	if row.PriceVersion <= 0 {
+		row.PriceVersion = 1
+	}
+
+	cost, err := engine.Settle(row, &pricing.ActualUsage{
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+	})
+	if err != nil {
+		// 定价配置损坏时退回 abilities 线性单价，保证账单不因配置错误丢失
+		cost = pricing.EstimateLinear(inputTokens, outputTokens, row.InputPrice1k, row.OutputPrice1k)
+	}
+	return cost, row.PriceVersion
 }
 
-// logAndRecord 同步写 usage_logs + 更新 Prometheus 指标
-func logAndRecord(c *gin.Context, tenantID, apiKeyID int64, model, providerType string,
-	inputTokens, outputTokens int64, cost float64, status, errorMessage string, start time.Time) {
+// logAndRecord 投递用量日志（App 级异步批量写库，宁丢不堵响应路径）+ 更新 Prometheus 指标
+func logAndRecord(c *gin.Context, a *app.App, scope requestScope, providerType string,
+	inputTokens, outputTokens int64, cost ledger.MicroUSD, priceVersion int, status, errorMessage string, start time.Time) {
 
-	pool := db.GetPool()
-	if pool != nil {
-		queryCtx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
-		defer cancel()
+	// 从 context 读取账本中间件设置的预占金额（ReservedCost，μUSD）
+	var reservedCostP *ledger.MicroUSD
+	if v, ok := c.Get("ledger_reserved"); ok {
+		if r, ok := v.(int64); ok {
+			m := ledger.MicroUSD(r)
+			reservedCostP = &m
+		}
+	}
+	// FinalCost 就是 handler 本次计算出的 cost
+	finalCost := cost
+	finalCostP := &finalCost
 
-		requestID := newUUID()
-		latencyMs := time.Since(start).Milliseconds()
+	// request_id 优先取中间件预生成的，fallback 到本地生成
+	requestID := c.GetString("request_id")
+	if requestID == "" {
+		requestID = requestid.New()
+	}
 
-		_, _ = pool.ExecContext(queryCtx, `
-			INSERT INTO usage_logs
-				(request_id, tenant_id, api_key_id, model, provider, input_tokens, output_tokens, cost, latency_ms, status, error_message)
-			VALUES
-				(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, requestID, tenantID, apiKeyID, model, providerType,
-			inputTokens, outputTokens, cost, latencyMs, status, errorMessage)
+	if a.Usage != nil {
+		a.Usage.Add(usagelog.Entry{
+			RequestID:      requestID,
+			TenantID:       scope.TenantID,
+			APIKeyID:       scope.APIKeyID,
+			ProjectID:      scope.ProjectID,
+			AssistantID:    scope.AssistantID,
+			Model:          scope.Model,
+			Provider:       providerType,
+			InputTokens:    inputTokens,
+			OutputTokens:   outputTokens,
+			Cost:           cost,
+			ReservedCost:   reservedCostP,
+			FinalCost:      finalCostP,
+			PriceVersion:   priceVersion,
+			LatencyMs:      time.Since(start).Milliseconds(),
+			Status:         status,
+			ErrorMessage:   errorMessage,
+			RetrievedCount: scope.RetrievedCount,
+			RetrievalMs:    int(scope.RetrievalMs),
+		})
 	}
 
 	// Prometheus 指标
 	observability.RecordRequest(
-		fmt.Sprintf("%d", tenantID),
-		model, providerType, status,
-		time.Since(start).Milliseconds(), cost,
+		fmt.Sprintf("%d", scope.TenantID),
+		scope.Model, providerType, status,
+		time.Since(start).Milliseconds(), cost.Dollars(),
 	)
 }
 
 // --- 响应构造 ---
 
-func openaiCompletionResponse(resp *provider.ChatResponse, model string) gin.H {
+// openaiCompletionResponse 非流式响应；citations 非空时挂在 message 上（客户端可直接渲染引用）
+func openaiCompletionResponse(resp *provider.ChatResponse, model string, citations []rag.Citation) gin.H {
+	message := gin.H{
+		"role":    "assistant",
+		"content": resp.Content,
+	}
+	if len(citations) > 0 {
+		message["citations"] = citations
+	}
 	return gin.H{
 		"id":      "chatcmpl-" + time.Now().Format("20060102150405"),
 		"object":  "chat.completion",
@@ -592,11 +598,8 @@ func openaiCompletionResponse(resp *provider.ChatResponse, model string) gin.H {
 		"model":   model,
 		"choices": []gin.H{
 			{
-				"index": 0,
-				"message": gin.H{
-					"role":    "assistant",
-					"content": resp.Content,
-				},
+				"index":         0,
+				"message":       message,
 				"finish_reason": "stop",
 			},
 		},
@@ -608,11 +611,23 @@ func openaiCompletionResponse(resp *provider.ChatResponse, model string) gin.H {
 	}
 }
 
-func buildStreamFrame(id string, created int64, model string, chunk provider.StreamChunk) string {
+func buildStreamFrame(id string, created int64, model string, chunk provider.StreamChunk, citations []rag.Citation) string {
 	var finishReason *string
 	if chunk.IsDone {
 		s := "stop"
 		finishReason = &s
+	}
+
+	choice := map[string]interface{}{
+		"index": 0,
+		"delta": map[string]interface{}{
+			"content": chunk.Content,
+		},
+		"finish_reason": finishReason,
+	}
+	// 引用只在最后一个 finish_reason=stop 的 chunk 下发一次
+	if chunk.IsDone && len(citations) > 0 {
+		choice["citations"] = citations
 	}
 
 	frame := map[string]interface{}{
@@ -620,38 +635,17 @@ func buildStreamFrame(id string, created int64, model string, chunk provider.Str
 		"object":  "chat.completion.chunk",
 		"created": created,
 		"model":   model,
-		"choices": []map[string]interface{}{
-			{
-				"index": 0,
-				"delta": map[string]interface{}{
-					"content": chunk.Content,
-				},
-				"finish_reason": finishReason,
-			},
-		},
+		"choices": []map[string]interface{}{choice},
 	}
 
 	if chunk.IsDone && chunk.InputTokens > 0 {
 		frame["usage"] = map[string]interface{}{
-			"prompt_tokens":      chunk.InputTokens,
-			"completion_tokens":  chunk.OutputTokens,
-			"total_tokens":       chunk.InputTokens + chunk.OutputTokens,
+			"prompt_tokens":     chunk.InputTokens,
+			"completion_tokens": chunk.OutputTokens,
+			"total_tokens":      chunk.InputTokens + chunk.OutputTokens,
 		}
 	}
 
 	b, _ := json.Marshal(frame)
 	return string(b)
-}
-
-// newUUID 生成 v4 风格 UUID
-func newUUID() string {
-	var buf [16]byte
-	_, _ = rand.Read(buf[:])
-	buf[6] = (buf[6] & 0x0f) | 0x40
-	buf[8] = (buf[8] & 0x3f) | 0x80
-	return hex.EncodeToString(buf[:4]) + "-" +
-		hex.EncodeToString(buf[4:6]) + "-" +
-		hex.EncodeToString(buf[6:8]) + "-" +
-		hex.EncodeToString(buf[8:10]) + "-" +
-		hex.EncodeToString(buf[10:])
 }

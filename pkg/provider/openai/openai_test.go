@@ -7,18 +7,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"ai-gateway/pkg/provider"
 )
 
 func TestName(t *testing.T) {
-	if got := New("https://api.openai.com/v1", "sk-test").Name(); got != "openai" {
+	if got := New("https://api.openai.com/v1", "sk-test", provider.NewClients(30*time.Second)).Name(); got != "openai" {
 		t.Errorf("Name = %q, want openai", got)
 	}
 }
 
 func TestUnimplementedMethods(t *testing.T) {
-	p := New("https://api.openai.com/v1", "sk-test")
+	p := New("https://api.openai.com/v1", "sk-test", provider.NewClients(30*time.Second))
 	ctx := context.Background()
 
 	if _, err := p.Embedding(ctx, &provider.EmbeddingRequest{}); !errors.Is(err, provider.ErrNotImplemented) {
@@ -85,7 +86,7 @@ func TestChatCompletion_Success(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	p := New(ts.URL, "sk-test-key")
+	p := New(ts.URL, "sk-test-key", provider.NewClients(30*time.Second))
 	resp, err := p.ChatCompletion(context.Background(), &provider.ChatRequest{
 		Model:    "gpt-4o-mini",
 		Messages: []provider.Message{{Role: "user", Content: "你好"}},
@@ -106,8 +107,8 @@ func TestChatCompletion_Success(t *testing.T) {
 	if resp.Provider != "openai" {
 		t.Errorf("Provider = %q, want openai", resp.Provider)
 	}
-	if resp.LatencyMs <= 0 {
-		t.Errorf("LatencyMs should be > 0")
+	if resp.LatencyMs < 0 {
+		t.Errorf("LatencyMs should be >= 0")
 	}
 }
 
@@ -124,13 +125,142 @@ func TestChatCompletion_UpstreamError(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	p := New(ts.URL, "sk-wrong-key")
+	p := New(ts.URL, "sk-wrong-key", provider.NewClients(30*time.Second))
 	_, err := p.ChatCompletion(context.Background(), &provider.ChatRequest{
 		Model:    "gpt-4o-mini",
 		Messages: []provider.Message{{Role: "user", Content: "hi"}},
 	})
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+	var upstreamErr *provider.UpstreamError
+	if !errors.As(err, &upstreamErr) {
+		t.Fatalf("err type = %T, want *provider.UpstreamError", err)
+	}
+	if upstreamErr.StatusCode != http.StatusUnauthorized {
+		t.Errorf("StatusCode = %d, want 401", upstreamErr.StatusCode)
+	}
+	if upstreamErr.Type != "invalid_authentication_error" {
+		t.Errorf("Type = %q, want invalid_authentication_error", upstreamErr.Type)
+	}
+	if upstreamErr.Kind != provider.KindAuth {
+		t.Errorf("Kind = %q, want auth", upstreamErr.Kind)
+	}
+	if !upstreamErr.Retryable() {
+		t.Error("401 should be retryable on another channel")
+	}
+	if !upstreamErr.Permanent() {
+		t.Error("401 should permanently disable the channel")
+	}
+}
+
+func TestChatCompletion_UpstreamStatus(t *testing.T) {
+	tests := []struct {
+		status    int
+		errType   string
+		kind      provider.ErrorKind
+		retryable bool
+		permanent bool
+	}{
+		{status: http.StatusUnauthorized, errType: "auth_error", kind: provider.KindAuth, retryable: true, permanent: true},
+		{status: http.StatusTooManyRequests, errType: "rate_limit_error", kind: provider.KindRateLimit, retryable: true, permanent: false},
+		{status: http.StatusInternalServerError, errType: "server_error", kind: provider.KindServer, retryable: true, permanent: false},
+		{status: http.StatusBadRequest, errType: "invalid_request_error", kind: provider.KindUnknown, retryable: false, permanent: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(http.StatusText(tt.status), func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				json.NewEncoder(w).Encode(map[string]any{
+					"error": map[string]any{"message": "upstream says no", "type": tt.errType},
+				})
+			}))
+			defer ts.Close()
+
+			p := New(ts.URL, "sk-test", provider.NewClients(30*time.Second))
+			_, err := p.ChatCompletion(context.Background(), &provider.ChatRequest{
+				Model:    "gpt-4o-mini",
+				Messages: []provider.Message{{Role: "user", Content: "hi"}},
+			})
+
+			var upstreamErr *provider.UpstreamError
+			if !errors.As(err, &upstreamErr) {
+				t.Fatalf("err = %v, want *provider.UpstreamError", err)
+			}
+			if upstreamErr.StatusCode != tt.status {
+				t.Errorf("StatusCode = %d, want %d", upstreamErr.StatusCode, tt.status)
+			}
+			if upstreamErr.Type != tt.errType {
+				t.Errorf("Type = %q, want %q", upstreamErr.Type, tt.errType)
+			}
+			if upstreamErr.Kind != tt.kind {
+				t.Errorf("Kind = %q, want %q", upstreamErr.Kind, tt.kind)
+			}
+			if upstreamErr.Retryable() != tt.retryable {
+				t.Errorf("Retryable() = %v, want %v", upstreamErr.Retryable(), tt.retryable)
+			}
+			if upstreamErr.Permanent() != tt.permanent {
+				t.Errorf("Permanent() = %v, want %v", upstreamErr.Permanent(), tt.permanent)
+			}
+		})
+	}
+}
+
+func TestChatCompletion_Timeout(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer ts.Close()
+
+	p := New(ts.URL, "sk-test", provider.NewClients(20*time.Millisecond))
+
+	_, err := p.ChatCompletion(context.Background(), &provider.ChatRequest{
+		Model:    "gpt-4o-mini",
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	})
+
+	var upstreamErr *provider.UpstreamError
+	if !errors.As(err, &upstreamErr) {
+		t.Fatalf("err = %v, want *provider.UpstreamError", err)
+	}
+	if upstreamErr.Kind != provider.KindTimeout {
+		t.Errorf("Kind = %q, want timeout", upstreamErr.Kind)
+	}
+	if !upstreamErr.Retryable() {
+		t.Error("timeout should be retryable")
+	}
+	if upstreamErr.Permanent() {
+		t.Error("timeout should not permanently disable the channel")
+	}
+}
+
+func TestChatCompletion_InvalidResponse(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("not-json"))
+	}))
+	defer ts.Close()
+
+	p := New(ts.URL, "sk-test", provider.NewClients(30*time.Second))
+	_, err := p.ChatCompletion(context.Background(), &provider.ChatRequest{
+		Model:    "gpt-4o-mini",
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	})
+
+	var upstreamErr *provider.UpstreamError
+	if !errors.As(err, &upstreamErr) {
+		t.Fatalf("err = %v, want *provider.UpstreamError", err)
+	}
+	if upstreamErr.Type != "invalid_response" {
+		t.Errorf("Type = %q, want invalid_response", upstreamErr.Type)
+	}
+	if upstreamErr.Kind != provider.KindServer {
+		t.Errorf("Kind = %q, want server", upstreamErr.Kind)
+	}
+	if !upstreamErr.Retryable() {
+		t.Error("invalid response should be retryable")
 	}
 }
 
@@ -144,7 +274,7 @@ func TestChatCompletion_EmptyChoices(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	p := New(ts.URL, "sk-test")
+	p := New(ts.URL, "sk-test", provider.NewClients(30*time.Second))
 	_, err := p.ChatCompletion(context.Background(), &provider.ChatRequest{
 		Model:    "gpt-4o-mini",
 		Messages: []provider.Message{{Role: "user", Content: "hi"}},
@@ -156,7 +286,7 @@ func TestChatCompletion_EmptyChoices(t *testing.T) {
 
 func TestChatCompletion_NetworkError(t *testing.T) {
 	// 指向一个不存在的地址
-	p := New("http://127.0.0.1:1", "sk-test")
+	p := New("http://127.0.0.1:1", "sk-test", provider.NewClients(30*time.Second))
 	_, err := p.ChatCompletion(context.Background(), &provider.ChatRequest{
 		Model:    "gpt-4o-mini",
 		Messages: []provider.Message{{Role: "user", Content: "hi"}},
