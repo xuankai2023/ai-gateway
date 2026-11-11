@@ -23,13 +23,14 @@ P0 全部 7 项已实现并通过编译/测试。
 | 启动入口 | `apps/gateway/cmd/main.go` | ✅ 已实现 |
 | 配置 | `pkg/config/config.go` | ✅ 已实现 |
 | 日志 | `pkg/observability/logger.go` | ✅ 已实现 |
-| PG 连接池 | `pkg/db/pool.go` | ✅ 已实现 |
+| MySQL 连接池 | `pkg/db/pool.go` | ✅ 已实现 |
 | Provider 工厂 | `pkg/provider/factory.go` | ✅ 已实现 |
 | OpenAI 适配器 | `pkg/provider/openai/openai.go` | ✅ 已实现（非流式 ChatCompletion + 流式 ChatCompletionStream + 单元测试） |
 | Provider 接口 | `pkg/provider/provider.go` | ✅ 已扩展（加 Streamer 可选接口 + StreamChunk 类型） |
 | 中间件链 | `apps/gateway/internal/middleware/chain.go` | ✅ Recover → Trace → Logger → Auth 四层 |
-| Auth 中间件 | `apps/gateway/internal/middleware/auth.go` | ✅ 直连 PG：Bearer→SHA256→api_keys→tenants |
+| Auth 中间件 | `apps/gateway/internal/middleware/auth.go` | ✅ 直连 MySQL：Bearer→SHA256→api_keys→tenants |
 | Chat Handler | `apps/gateway/internal/handler/chat_completion.go` | ✅ 完整实现：模型路由 + 非流式 + 流式 SSE + usage_logs + 计费 |
+| 路由 / 中继 | `apps/gateway/internal/routing` + `apps/gateway/internal/relay` | ✅ abilities 优先 + models 兜底 + 按渠道重试 + 熔断 |
 | SQL 迁移 | `sql/001_init_core.up.sql` | ✅ 4 张核心表（tenants/api_keys/models/usage_logs） |
 | SQL 回滚 | `sql/001_init_core.down.sql` | ✅ 完整 DROP TABLE |
 
@@ -39,20 +40,20 @@ P0 全部 7 项已实现并通过编译/测试。
 
 | # | 模块 | 最小实现 | 验收标准 | 状态 |
 |---|---|---|---|---|
-| 1 | 启动骨架 | 读 `config.yaml` → 连 PG → 注册 Provider → 装中间件 → 监听 `:8080` | `curl /healthz` 返回 200 | ✅ 已完成 |
+| 1 | 启动骨架 | 读 `config.yaml` → 连 MySQL → 注册 Provider → 装中间件 → 监听 `:8080` | `curl /healthz` 返回 200 | ✅ 已完成 |
 | 2 | 供应商适配器 | 只实现 **1 个 OpenAI 兼容 Provider**（非流式 + 流式 SSE） | 能对真实上游发起一次 chat 并解析出 content 和 usage | ✅ 已完成 |
-| 3 | API Key 鉴权 | 从 `Authorization: Bearer` 取 key，SHA256 后查 `api_keys`，塞 `tenant_id` 进 context；先直连 PG 不接 Redis | 无 key / 错 key 返回 401，正确 key 放行 | ✅ 已完成 |
-| 4 | 模型路由 | 用 `tenant_id + model_name` 查 `models` 表，取 `provider + provider_model`，交给 Factory 建实例 | 请求模型名能映射到正确上游模型 | ✅ 已完成 |
+| 3 | API Key 鉴权 | 从 `Authorization: Bearer` 取 key，SHA256 后查 `api_keys`，塞 `tenant_id` 进 context；先直连 MySQL 不接 Redis | 无 key / 错 key 返回 401，正确 key 放行 | ✅ 已完成 |
+| 4 | 模型路由 | 优先查 `abilities`（按优先级分层），无记录时用 `tenant_id + model_name` 查 `models` 表兜底 | 请求模型名能映射到正确上游模型 | ✅ 已完成 |
 | 5 | Chat Handler | 非流式：请求体透传上游、回 JSON；流式：`stream=true` 时 SSE 逐块转发并在结束时正常 `[DONE]` | 两种模式都能拿到正确回复，流式不卡死、不截断 | ✅ 已完成 |
-| 6 | 用量记账 | 从响应里取 input/output tokens，`INSERT` 一条 `usage_logs`；先同步写 PG，不走 Kafka | 每次调用都能在表里查到记录和 latency | ✅ 已完成 |
-| 7 | 最小计费 | `cost = input_tokens × input_price_1k / 1000 + output_tokens × output_price_1k / 1000`，单价读 `models` 表 | 表里 cost 与手工计算一致 | ✅ 已完成 |
+| 6 | 用量记账 | 从响应里取 input/output tokens，`INSERT` 一条 `usage_logs`；先同步写 MySQL，不走 Kafka | 每次调用都能在表里查到记录和 latency | ✅ 已完成 |
+| 7 | 最小计费 | `cost = input_tokens × input_price_1k / 1000 + output_tokens × output_price_1k / 1000`，单价读当前渠道或 `models` 表 | 表里 cost 与手工计算一致 | ✅ 已完成 |
 
 ---
 
 ## 4. 最小请求链路
 
 ```
-API Key → 鉴权(tenant) → 查 models 得上游配置 → OpenAI Provider 转发
+API Key → 鉴权(tenant) → abilities / models 得候选渠道 → Provider 转发
         → 解析 content + usage → 写 usage_logs → 返回
 ```
 
@@ -72,7 +73,7 @@ Recover → Trace → Logger → Auth → ChatCompletion Handler
                               ↑ 内部完成模型路由 / 调用 / 记账 / 计费
 ```
 
-> 顺序说明：本阶段不引入 Quota / Cache / Gray / 重试循环，模型路由直接放在 Handler 内完成，避免为最小链路引入额外中间件状态。
+> 顺序说明：P0 最小链路不引入 Quota / Cache / Gray。模型路由、逐渠道重试与熔断在后续优化中落地（见 `docs/optimization-plan.md`），Handler 只负责解析、编解码与输出。
 
 ---
 
@@ -83,20 +84,20 @@ Recover → Trace → Logger → Auth → ChatCompletion Handler
 ```sql
 -- 1. 租户
 INSERT INTO tenants (name, tier, budget_monthly)
-VALUES ('demo', 'free', 100)
-RETURNING id;   -- 记下 id，下文用 1 代替
+VALUES ('demo', 'free', 100);
+SET @tenant_id = LAST_INSERT_ID();   -- 记下 id
 
 -- 2. API Key（只存 SHA256，不存明文）
 --    生成哈希：printf '%s' 'sk-demo-123' | shasum -a 256 | awk '{print $1}'
 INSERT INTO api_keys (tenant_id, hash_key, name)
-VALUES (1, '<上一步生成的哈希>', 'demo-key');
+VALUES (@tenant_id, '<上一步生成的哈希>', 'demo-key');
 
 -- 3. 模型映射与单价（provider 必须与 config.providers[].type 一致）
 INSERT INTO models (
     tenant_id, model_name, provider, provider_model,
     input_price_1k, output_price_1k
 ) VALUES (
-    1, 'demo-chat', 'openai', 'gpt-4o-mini',
+    @tenant_id, 'demo-chat', 'openai', 'gpt-4o-mini',
     0.0015, 0.006
 );
 ```
@@ -149,7 +150,7 @@ curl -i -sS http://localhost:8080/v1/chat/completions \
 # 期望 401
 
 # 记账核对
-psql "$PG_DSN" -c \
+mysql "$MYSQL_DSN" -e \
   "SELECT request_id, model, provider, input_tokens, output_tokens, cost, latency_ms, status
    FROM usage_logs ORDER BY id DESC LIMIT 1;"
 ```
@@ -165,7 +166,7 @@ cost = 12 × 0.0015 / 1000 + 30 × 0.006 / 1000 = 0.000018 + 0.00018 = 0.000198
 ## 8. 明确不做（不属于"最基础"）
 
 - 语义缓存、Qdrant、Embedding、RAG
-- 灰度分流、熔断降级、多渠道路由权重、重试换渠道
+- 灰度分流（多渠道路由权重、重试换渠道、熔断已作为后续优化落地，不属于 P0 原始范围）
 - 内容审核（Moderation）
 - 预扣押金 / Redis Lua / 信任额度
 - Kafka 异步账单、B2B 套餐 / 发票 / 信用额度
@@ -181,7 +182,7 @@ cost = 12 × 0.0015 / 1000 + 30 × 0.006 / 1000 = 0.000018 + 0.00018 = 0.000198
 - [x] 正确 Key 非流式调用返回正常 content，HTTP 200
 - [x] 正确 Key 流式调用逐块输出，最终以 `[DONE]` 正常结束
 - [x] 无 Key / 错 Key 返回 401，租户停用返回 403
-- [x] 请求的 `model` 能按 `models` 表映射到上游真实模型
+- [x] 请求的 `model` 能按 `abilities` / `models` 表映射到上游真实模型
 - [x] `usage_logs` 每次调用都有记录，`cost` 与手工计算一致
 
-> 以上代码层面均已实现并通过编译/测试。端到端验收（curl + 真实上游 + PG）需启动服务后按第 7 节命令执行。
+> 以上代码层面均已实现并通过编译/测试。端到端验收（curl + 真实上游 + MySQL）需启动服务后按第 7 节命令执行。
