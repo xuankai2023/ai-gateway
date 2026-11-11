@@ -1,0 +1,35 @@
+# 管理面网络隔离（阶段 16 安全加固）
+#
+# 管理面（:8082，/admin/v1）与业务面（:8080，/v1）端口级隔离：
+#   - 业务面：经 Ingress/Service 暴露给 API 消费者
+#   - 管理面：NetworkPolicy 仅放行内网网段（运维跳板机 / CI / 内部管控台），
+#     不经 Ingress 暴露；X-Admin-Token 是第二道防线（NetworkPolicy 是第一道）
+#
+# 注意：10.0.0.0/8 与 192.168.0.0/16 为内网网段示例，按实际 VPC CIDR 收紧。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-admin-isolation
+  namespace: ai-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    # 业务面 + 指标面：全集群可入（Prometheus 抓取 / API 流量）
+    - ports:
+        - port: 8080
+          protocol: TCP
+        - port: 8081
+          protocol: TCP
+    # 管理面：仅内网网段可入
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+        - ipBlock:
+            cidr: 192.168.0.0/16
+      ports:
+        - port: 8082
+          protocol: TCP
