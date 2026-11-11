@@ -10,6 +10,9 @@ mysql:
 redis:
   addr: "localhost:6379"
   password: ""
+  db: 0
+  pool_size: 100
+  dial_timeout: "3s"
 
 kafka:
   brokers: ["localhost:9092"]
@@ -17,12 +20,53 @@ kafka:
 
 qdrant:
   addr: "localhost:6333"
+  # 语义缓存向量层（可选）：addr + embedding_url 同时配置才启用；
+  # 仅配 addr 时退化为 Redis 精确哈希单层缓存
+  embedding_url: ""            # OpenAI 兼容完整地址，如 http://127.0.0.1:8081/v1/embeddings
+  embedding_model: ""          # 如 text-embedding-3-small
+  embedding_api_key_env: ""    # embedding 服务 key 所在环境变量名（可空）
+  score_threshold: 0.95        # 向量相似命中阈值
+
+# RAG 多项目知识库（检索与切分参数；向量化与 Qdrant 连接复用上面的 qdrant 段）
+# 隔离模型：API Key → project_id；model 命中 assistants 表 → 该项目独立 collection kb_<slug>
+rag:
+  enabled: false               # 开启后 handler 会解析助手并检索知识库；false = 纯 LLM 转发
+  top_k: 5                     # 默认召回条数（assistants.top_k 优先）
+  score_threshold: 0.3         # 默认相似度下限（assistants.score_threshold 优先）
+  max_context_tokens: 2000     # 检索资料默认 token 预算（assistants.max_context_tokens 优先）
+  retrieval_timeout: "800ms"   # 检索硬超时：超时降级为"无资料回答"，不返回 5xx
+  chunk_size: 400              # 单 chunk 目标字数（入库 CLI 使用）
+  chunk_overlap: 50            # 相邻 chunk 重叠字数
+  collection_prefix: "kb_"     # collection = prefix + project.slug
 
 gateway:
   listen_addr: ":8080"
   listen_metrics: ":8081"
   default_rps_limit: 10
   default_tpm_limit: 10000
+  # 租户并发数默认上限（tenants.concurrency_limit 为 NULL 时回落）
+  default_concurrency_limit: 50
+  # 全局在途请求硬上限（load_shed 信号量容量；超出后排队 2s 仍拿不到即 503）
+  max_in_flight: 1000
+  # 单次请求最大尝试渠道数（重试按渠道数计算，每个渠道最多尝试一次）
+  max_attempts: 4
+  # 分层超时：单次渠道 attempt 上限（非流式整次调用 / 流式建连+首帧）
+  attempt_timeout: "30s"
+  # 非流式请求整链路上限（含全部渠道重试），超时返回 504
+  request_timeout: "60s"
+  # 流式请求总时长兜底（长回答不被 request_timeout 误杀）
+  stream_max_duration: "300s"
+  # 允许跨域的前端来源；["*"] 允许任意来源（本地开发），生产建议改成具体域名
+  cors_allowed_origins: ["*"]
+
+# 可观测性：未启用 tracing 时保持 Noop，不建立任何 exporter 连接
+observability:
+  tracing:
+    enabled: false
+    endpoint: "localhost:4317"
+    insecure: true
+    # 采样率 [0, 1]
+    sample_ratio: 1.0
 
 # 供应商注册配置：API Key 只写环境变量名，真实密钥不落配置文件
 providers:
@@ -35,3 +79,20 @@ providers:
   - type: volcengine
     base_url: "https://ark.cn-beijing.volces.com/api/v3"
     api_key_env: "ARK_API_KEY"
+  - type: deepseek
+    base_url: "https://api.deepseek.com/v1"
+    api_key_env: "DEEPSEEK_API_KEY"
+
+# 管理面（阶段 15）：独立端口 + X-Admin-Token，与业务 api_keys 体系隔离
+# 生产环境 admin 端口经 NetworkPolicy 仅内网可达（见 infra/k8s/admin-networkpolicy.yaml）
+admin:
+  listen_addr: ":8082"
+  # 管理面令牌；支持 env:// 引用（推荐，不落明文）。为空 → 管理面不启动
+  token: "env://ADMIN_TOKEN"
+
+# Vault 凭证托管（阶段 16）：配置 addr 后，channel_keys.key_ref 与 providers[].api_key_ref
+# 支持 vault:// 前缀引用（Vault KV v2，data.data 下取 api_key/value 字段）
+vault:
+  addr: ""                  # 如 http://127.0.0.1:8200；空 = 未启用（vault:// 引用解析为空并跳过）
+  token_env: "VAULT_TOKEN"  # Vault token 所在环境变量名
+  timeout: "3s"
