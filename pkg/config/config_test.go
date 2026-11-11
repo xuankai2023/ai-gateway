@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeConfig 在临时目录写一份配置，返回路径
@@ -76,6 +77,8 @@ func TestLoadDefaultListenAddrAndPoolSize(t *testing.T) {
 	path := writeConfig(t, `
 mysql:
   dsn: "root@tcp(localhost:3306)/ai_gateway"
+redis:
+  addr: "localhost:6379"
 `)
 
 	cfg, err := Load(path)
@@ -88,9 +91,52 @@ mysql:
 	if got, want := cfg.MySQL.PoolSize, 20; got != want {
 		t.Errorf("默认 mysql.pool_size = %d, want %d", got, want)
 	}
-	// 可选依赖（etcd / redis / kafka / qdrant）缺失不应报错
+	// 限流默认值：rps=10 / tpm=10000 / concurrency=50
+	if got, want := cfg.Gateway.DefaultRPSLimit, 10; got != want {
+		t.Errorf("默认 default_rps_limit = %d, want %d", got, want)
+	}
+	if got, want := cfg.Gateway.DefaultTPMLimit, 10000; got != want {
+		t.Errorf("默认 default_tpm_limit = %d, want %d", got, want)
+	}
+	if got, want := cfg.Gateway.DefaultConcurrencyLimit, 50; got != want {
+		t.Errorf("默认 default_concurrency_limit = %d, want %d", got, want)
+	}
+	if got, want := cfg.Gateway.MaxInFlight, 1000; got != want {
+		t.Errorf("默认 max_in_flight = %d, want %d", got, want)
+	}
+	// 可选依赖（etcd / kafka / qdrant）缺失不应报错
 	if cfg.Etcd.Endpoints != nil || cfg.Kafka.Brokers != nil {
 		t.Errorf("可选依赖缺失时不应被填充: etcd=%v kafka=%v", cfg.Etcd.Endpoints, cfg.Kafka.Brokers)
+	}
+}
+
+func TestLoadMissingRedisAddr(t *testing.T) {
+	path := writeConfig(t, "mysql:\n  dsn: \"root@tcp(localhost:3306)/ai_gateway\"\n")
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("期望报错，实际为 nil")
+	}
+	if !strings.Contains(err.Error(), "redis.addr") {
+		t.Errorf("错误信息应指出 redis.addr: %v", err)
+	}
+}
+
+func TestLoadInvalidRedisDialTimeout(t *testing.T) {
+	path := writeConfig(t, `
+mysql:
+  dsn: "root@tcp(localhost:3306)/ai_gateway"
+redis:
+  addr: "localhost:6379"
+  dial_timeout: "not-a-duration"
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("期望报错，实际为 nil")
+	}
+	if !strings.Contains(err.Error(), "redis.dial_timeout") {
+		t.Errorf("错误信息应指出 redis.dial_timeout: %v", err)
 	}
 }
 
@@ -140,5 +186,130 @@ func TestLoadEmptyPathUsesDefault(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), DefaultPath) {
 		t.Errorf("错误信息应包含默认路径 %q: %v", DefaultPath, err)
+	}
+}
+
+func TestLoadTimeoutDefaults(t *testing.T) {
+	path := writeConfig(t, `
+mysql:
+  dsn: "root@tcp(localhost:3306)/ai_gateway"
+redis:
+  addr: "localhost:6379"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if got, want := cfg.Gateway.RequestTimeout, "60s"; got != want {
+		t.Errorf("默认 request_timeout = %q, want %q", got, want)
+	}
+	if got, want := cfg.Gateway.AttemptTimeout, "30s"; got != want {
+		t.Errorf("默认 attempt_timeout = %q, want %q", got, want)
+	}
+	if got, want := cfg.Gateway.StreamMaxDuration, "300s"; got != want {
+		t.Errorf("默认 stream_max_duration = %q, want %q", got, want)
+	}
+
+	request, attempt, streamMax := cfg.Gateway.TimeoutDurations()
+	if request != 60*time.Second || attempt != 30*time.Second || streamMax != 300*time.Second {
+		t.Errorf("TimeoutDurations = %v/%v/%v, want 60s/30s/300s", request, attempt, streamMax)
+	}
+}
+
+func TestLoadCustomTimeouts(t *testing.T) {
+	path := writeConfig(t, `
+mysql:
+  dsn: "root@tcp(localhost:3306)/ai_gateway"
+redis:
+  addr: "localhost:6379"
+gateway:
+  request_timeout: "90s"
+  attempt_timeout: "15s"
+  stream_max_duration: "600s"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	request, attempt, streamMax := cfg.Gateway.TimeoutDurations()
+	if request != 90*time.Second || attempt != 15*time.Second || streamMax != 600*time.Second {
+		t.Errorf("TimeoutDurations = %v/%v/%v, want 90s/15s/600s", request, attempt, streamMax)
+	}
+}
+
+func TestLoadInvalidAttemptTimeout(t *testing.T) {
+	path := writeConfig(t, `
+mysql:
+  dsn: "root@tcp(localhost:3306)/ai_gateway"
+redis:
+  addr: "localhost:6379"
+gateway:
+  attempt_timeout: "abc"
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("期望报错，实际为 nil")
+	}
+	if !strings.Contains(err.Error(), "gateway.attempt_timeout") {
+		t.Errorf("错误信息应指出 gateway.attempt_timeout: %v", err)
+	}
+}
+
+// RAG 未配置时使用默认值（检索超时 800ms，切分 400/50）
+func TestLoadRAGDefaults(t *testing.T) {
+	path := writeConfig(t, `
+mysql:
+  dsn: "root@tcp(localhost:3306)/ai_gateway"
+redis:
+  addr: "localhost:6379"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.RAG.Enabled {
+		t.Error("默认应关闭 rag")
+	}
+	if cfg.RAG.TopK != 5 || cfg.RAG.ScoreThreshold != 0.3 ||
+		cfg.RAG.MaxContextTokens != 2000 || cfg.RAG.ChunkSize != 400 ||
+		cfg.RAG.ChunkOverlap != 50 || cfg.RAG.CollectionPrefix != "kb_" {
+		t.Errorf("RAG 默认值异常: %+v", cfg.RAG)
+	}
+	if got := cfg.RAG.RetrievalTimeoutDuration(); got != 800*time.Millisecond {
+		t.Errorf("默认 retrieval timeout = %v, want 800ms", got)
+	}
+}
+
+// rag.enabled=true 时必须配置 Qdrant 与 embedding（避免启动后静默不检索）
+func TestLoadRAGEnabledRequiresVectorDeps(t *testing.T) {
+	path := writeConfig(t, `
+mysql:
+  dsn: "root@tcp(localhost:3306)/ai_gateway"
+redis:
+  addr: "localhost:6379"
+rag:
+  enabled: true
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "qdrant.addr") {
+		t.Fatalf("期望 qdrant.addr 校验错误, got %v", err)
+	}
+}
+
+func TestLoadRAGInvalidRetrievalTimeout(t *testing.T) {
+	path := writeConfig(t, `
+mysql:
+  dsn: "root@tcp(localhost:3306)/ai_gateway"
+redis:
+  addr: "localhost:6379"
+rag:
+  retrieval_timeout: "0s"
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "rag.retrieval_timeout") {
+		t.Fatalf("期望 rag.retrieval_timeout 校验错误, got %v", err)
 	}
 }
