@@ -1,11 +1,29 @@
-# Prometheus 抓取配置（占位）
+# Prometheus 抓取配置（阶段 7 落地）
 #
-# scrape_configs:
-#   - job_name: ai-gateway
-#     static_configs:
-#       - targets: ["gateway:8081"]   # /metrics 端点
-#   - job_name: ai-worker
-#     static_configs:
-#       - targets: ["worker:9091"]
-#
-# 规则文件：rules.yml（熔断告警 / 错误率告警 / P99 延迟告警）
+# gateway metrics 暴露在 :8081/metrics（gateway.listen_metrics 配置），
+# worker metrics 暴露在 :9091/metrics（占位，未来 Worker 落地后启用）。
+
+scrape_configs:
+  - job_name: ai-gateway
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["gateway:8081"]
+        labels:
+          service: ai-gateway
+
+  - job_name: ai-worker
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["worker:9091"]
+        labels:
+          service: ai-worker
+
+# 告警规则文件
+rule_files:
+  - "rules.yml"
+
+# 告警管理器（占位，后续接入 Alertmanager）
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]

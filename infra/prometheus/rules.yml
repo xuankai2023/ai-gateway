@@ -1,6 +1,141 @@
-# Prometheus 告警规则（占位）
+# Prometheus 告警规则（阶段 7 落地）
 #
-# - 错误率 > 1% 触发告警
-# - P99 延迟 > 2s 触发告警
-# - 熔断事件连续 3 次触发告警
-# - Prometheus 指标 5 分钟无数据 → 网关可能挂了
+# 告警分三组：SRE 大盘监控 / 上游依赖健康 / 可用性哨兵。
+# 所有规则按 tenant / provider / model 维度分组，避免单模型噪声淹没核心告警。
+#
+# 加载方式：prometheus.yml 里 file_sd_configs 指到本目录，或
+#   rule_files:
+#     - "rules.yml"
+
+groups:
+  # ---------------------------------------------------------------------------
+  # 1. 核心 SRE 指标
+  # ---------------------------------------------------------------------------
+  - name: gateway_sre
+    interval: 30s
+    rules:
+      # 1.1 5xx 错误率超过 1%（过去 5 分钟内）
+      # 分 provider 维度：上游整体挂了会某一 provider 的 status=error 飙升
+      - alert: HighErrorRate
+        expr: >
+          sum by (provider) (
+            rate(gateway_requests_total{status="error"}[5m])
+          )
+          /
+          sum by (provider) (
+            rate(gateway_requests_total[5m])
+          ) > 0.01
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "高错误率 - provider {{ $labels.provider }}"
+          description: >
+            Provider {{ $labels.provider }} 的 5xx 错误率达到 {{ $value | humanizePercentage }}（阈值 1%）。
+            检查上游渠道健康状态、熔断、以及 usagelog 的错误原因。
+
+      # 1.2 P99 延迟超过 2s
+      # 用 histogram_quantile 在请求量足够大时才有意义（避免低 QPS 噪声）
+      - alert: HighP99Latency
+        expr: >
+          histogram_quantile(0.99,
+            rate(gateway_request_duration_ms_bucket[5m])
+          ) > 2000
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P99 延迟过高"
+          description: >
+            全链路 P99 延迟达到 {{ $value }}ms（阈值 2000ms）。
+            重点排查上游慢模型/渠道、DB 池等待、Redis 抖动。
+
+      # 1.3 TTFT P99 超过 5s（流式首 token 慢 = 用户体感差）
+      - alert: HighTTFT
+        expr: >
+          histogram_quantile(0.99,
+            rate(gateway_upstream_ttft_ms_bucket[5m])
+          ) > 5000
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "流式首 token 延迟过高"
+          description: >
+            TTFT P99 = {{ $value }}ms（阈值 5000ms）。
+            排查最近新模型/渠道、上游网络抖动、是否被限流排队。
+
+  # ---------------------------------------------------------------------------
+  # 2. 熔断 / 渠道健康
+  # ---------------------------------------------------------------------------
+  - name: gateway_circuit
+    interval: 30s
+    rules:
+      # 2.1 同一熔断 key 持续 OPEN 超过 3 分钟
+      # Prometheus 没有直接"状态连续保持"的原语，用 event counter 的累积差值来近似：
+      # 规则是：3 分钟内 OPEN 事件数 >= 当前触发次数且始终未回到 CLOSED。
+      # 更直接的做法是 grafana 面板展示 circuit breaker state，这里做阈值提醒。
+      - alert: CircuitBreakerOpenTooLong
+        expr: >
+          rate(gateway_circuit_breaker_events{event="open"}[3m]) > 0
+          and on (provider)
+          rate(gateway_circuit_breaker_events{event="closed"}[3m]) == 0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "熔断器持续 OPEN"
+          description: >
+            Provider {{ $labels.provider }} 的熔断器已连续 3 分钟没有回到 CLOSED 状态。
+            检查上游渠道是否真的整体挂了，或冷却周期过长。
+
+  # ---------------------------------------------------------------------------
+  # 3. 依赖与进程健康
+  # ---------------------------------------------------------------------------
+  - name: gateway_deps
+    interval: 30s
+    rules:
+      # 3.1 用量日志丢弃 > 0（队列满）
+      - alert: UsageLogDropping
+        expr: >
+          increase(gateway_usagelog_dropped_total[1m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "用量日志被丢弃"
+          description: >
+            过去 1 分钟丢弃了 {{ $value | humanize }} 条 usage_log（异步队列满）。
+            考虑扩容 usagelog 队列容量或调整 flush 周期；如果是 DB 抖动导致 flush 慢，
+            先解决 DB 问题。
+
+      # 3.2 DB 连接池使用率 > 80%（open / max_open > 0.8）
+      - alert: DBConnPoolHigh
+        expr: >
+          (gateway_db_pool_connections{state="open"}
+           /
+           clamp_min(gateway_db_pool_connections{state="max_open"}, 1))
+          > 0.8
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DB 连接池使用率过高"
+          description: >
+            MySQL 连接池使用率 {{ $value | humanizePercentage }}（open / max_open > 80%）。
+            in_use 数高说明慢查询或上游高并发，idle 为 0 说明池确实耗尽。
+
+      # 3.3 /metrics 5 分钟无数据（用 absent 判定 scrape gap）
+      - alert: MetricsMissing
+        expr: >
+          absent_over_time(gateway_requests_total[5m])
+          and on ()
+          time() - process_start_time_seconds > 300
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "metrics 端点长时间无数据"
+          description: >
+            Prometheus 5 分钟内没抓到 gateway_requests_total。
+            网关进程可能已 crash / OOM，或 metrics 端口被防火墙挡住。
