@@ -1,7 +1,23 @@
-// Console Next.js 根布局（占位）
-// 路由结构：
-//   /gateway/config    网关配置中心
-//   /tenants           租户管理
-//   /cost              成本看板
-//   /gray              灰度发布面板
-//   /monitor           可观测性
+import type { Metadata } from "next";
+import { AntdRegistry } from "@ant-design/nextjs-registry";
+import Providers from "@/components/Providers";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "AI Gateway Console",
+  description: "AI Gateway 管理控制台",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{ children: React.ReactNode }>) {
+  return (
+    <html lang="zh-CN">
+      <body>
+        <AntdRegistry>
+          <Providers>{children}</Providers>
+        </AntdRegistry>
+      </body>
+    </html>
+  );
+}
