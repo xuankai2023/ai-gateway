@@ -1,22 +1,24 @@
 // Migrate CLI — 数据库迁移工具
 //
 // 命令：
-//   go run . up [N]         执行所有未执行的迁移（或 N 个）
-//   go run . down [N]       回滚最后一个迁移（或 N 个）
-//   go run . create <name>  创建新的 up/down SQL 迁移文件
-//   go run . version        显示当前数据库迁移版本
-//   go run . force <N>      强制设置版本号（修复脏状态：dirty → clean）
+//
+//	go run . up [N]         执行所有未执行的迁移（或 N 个）
+//	go run . down [N]       回滚最后一个迁移（或 N 个）
+//	go run . create <name>  创建新的 up/down SQL 迁移文件
+//	go run . version        显示当前数据库迁移版本
+//	go run . force <N>      强制设置版本号（修复脏状态：dirty → clean）
 //
 // 底层：golang-migrate v4
 // SQL 文件：项目根 sql/ 目录
 // DSN 来源：config.yaml 的 mysql.dsn 字段（默认 apps/gateway/configs/config.yaml）
 //
 // 示例：
-//   cd apps/migrate && go run . up           # 跑所有迁移
-//   cd apps/migrate && go run . up 1         # 只跑 1 个迁移
-//   cd apps/migrate && go run . down         # 回滚最后一个
-//   cd apps/migrate && go run . create       # 创建 003_xxx.up.sql + 003_xxx.down.sql
-//   cd apps/migrate && go run . force 2      # 强制版本设为 2（001 + 002 视为已执行）
+//
+//	cd apps/migrate && go run . up           # 跑所有迁移
+//	cd apps/migrate && go run . up 1         # 只跑 1 个迁移
+//	cd apps/migrate && go run . down         # 回滚最后一个
+//	cd apps/migrate && go run . create       # 创建 003_xxx.up.sql + 003_xxx.down.sql
+//	cd apps/migrate && go run . force 2      # 强制版本设为 2（001 + 002 视为已执行）
 package main
 
 import (
