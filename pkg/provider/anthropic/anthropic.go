@@ -1,10 +1,10 @@
 // Package anthropic Anthropic Claude Provider
 //
 // 使用官方 Messages API（POST /v1/messages），与 OpenAI 协议不同：
-//  - Header 用 x-api-key + anthropic-version
-//  - 请求体有 system 字段 / max_tokens 必填 / stream 布尔
-//  - 响应体 content 是 block 数组（text / tool_use），usage 字段名 input_tokens / output_tokens
-//  - 流式 SSE 事件类型：message_start → content_block_delta* → message_delta → message_stop
+//   - Header 用 x-api-key + anthropic-version
+//   - 请求体有 system 字段 / max_tokens 必填 / stream 布尔
+//   - 响应体 content 是 block 数组（text / tool_use），usage 字段名 input_tokens / output_tokens
+//   - 流式 SSE 事件类型：message_start → content_block_delta* → message_delta → message_stop
 //
 // 实现策略：参考 OpenAI Provider 的完整度——ChatCompletion + ChatCompletionStream + Name 三个完整实现；
 // Embedding / Moderation / Cost 返回 ErrNotImplemented（与 OpenAI 保持一致的阶段取舍）。
@@ -26,28 +26,32 @@ import (
 
 // Provider Anthropic Claude 供应商
 type Provider struct {
-	baseURL   string
-	apiKey    string
-	client    *http.Client
+	baseURL          string
+	apiKey           string
+	clients          *provider.Clients
 	anthropicVersion string
 }
 
 // New 创建 Anthropic Provider
 // baseURL 官方是 https://api.anthropic.com，也可以兼容代理端点
-func New(baseURL, apiKey string) *Provider {
+// clients 由 main 启动时统一构造注入（非流式带 attempt 总超时，流式无总超时）
+func New(baseURL, apiKey string, clients *provider.Clients) *Provider {
 	return &Provider{
 		baseURL:          strings.TrimRight(baseURL, "/"),
 		apiKey:           apiKey,
 		anthropicVersion: "2023-06-01",
-		client: &http.Client{
-			Timeout: 120 * time.Second,
-		},
+		clients:          clients,
 	}
 }
 
 // Name 供应商标识
 func (p *Provider) Name() string {
 	return "anthropic"
+}
+
+// BaseURL 上游端点（熔断 key 用）
+func (p *Provider) BaseURL() string {
+	return p.baseURL
 }
 
 // --- ChatCompletion 非流式 ---
@@ -82,13 +86,13 @@ type anthropicUsage struct {
 
 // anthropicResponse Claude Messages API 响应体（非流式）
 type anthropicResponse struct {
-	ID           string                  `json:"id"`
-	Type         string                  `json:"type"` // 应该是 "message"
-	Role         string                  `json:"role"`
-	Content      []anthropicContentBlock `json:"content"`
-	Model        string                  `json:"model"`
-	StopReason   string                  `json:"stop_reason"`
-	Usage        anthropicUsage          `json:"usage"`
+	ID         string                  `json:"id"`
+	Type       string                  `json:"type"` // 应该是 "message"
+	Role       string                  `json:"role"`
+	Content    []anthropicContentBlock `json:"content"`
+	Model      string                  `json:"model"`
+	StopReason string                  `json:"stop_reason"`
+	Usage      anthropicUsage          `json:"usage"`
 }
 
 // anthropicErrorResponse 错误响应体
@@ -145,30 +149,30 @@ func (p *Provider) ChatCompletion(ctx context.Context, req *provider.ChatRequest
 	httpReq.Header.Set("x-api-key", p.apiKey)
 	httpReq.Header.Set("anthropic-version", p.anthropicVersion)
 
-	resp, err := p.client.Do(httpReq)
+	resp, err := p.clients.NonStream.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: http call failed: %w", err)
+		return nil, provider.NewNetworkError(p.Name(), err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: read response body: %w", err)
+		return nil, provider.NewNetworkError(p.Name(), err)
 	}
 
 	// 3. 错误处理
 	if resp.StatusCode >= 400 {
 		var errResp anthropicErrorResponse
 		if e := json.Unmarshal(respBody, &errResp); e == nil && errResp.Error.Message != "" {
-			return nil, fmt.Errorf("anthropic: upstream error [%s] %s", errResp.Error.Type, errResp.Error.Message)
+			return nil, provider.NewUpstreamError(p.Name(), resp.StatusCode, errResp.Error.Type, errResp.Error.Message)
 		}
-		return nil, fmt.Errorf("anthropic: upstream returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, provider.NewUpstreamError(p.Name(), resp.StatusCode, "http_error", string(respBody))
 	}
 
 	// 4. 解析成功响应
 	var parsed anthropicResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, fmt.Errorf("anthropic: unmarshal response: %w", err)
+		return nil, provider.NewInvalidResponseError(p.Name(), resp.StatusCode, "unmarshal response: "+err.Error())
 	}
 
 	// 拼接所有 text block（忽略 tool_use 等非 text 块）
@@ -199,7 +203,7 @@ type anthropicSSEEvent struct {
 
 // contentBlockDeltaEvent content_block_delta 事件
 type contentBlockDeltaEvent struct {
-	Type  string `json:"type"`  // "content_block_delta"
+	Type  string `json:"type"` // "content_block_delta"
 	Index int    `json:"index"`
 	Delta struct {
 		Type string `json:"type"` // "text_delta"
@@ -216,7 +220,7 @@ type messageDeltaEvent struct {
 
 // messageStartEvent message_start 事件（含初始 usage）
 type messageStartEvent struct {
-	Type    string         `json:"type"` // "message_start"
+	Type    string `json:"type"` // "message_start"
 	Message struct {
 		Usage anthropicUsage `json:"usage"`
 	} `json:"message"`
@@ -275,9 +279,9 @@ func (p *Provider) ChatCompletionStream(ctx context.Context, req *provider.ChatR
 		httpReq.Header.Set("anthropic-version", p.anthropicVersion)
 		httpReq.Header.Set("Accept", "text/event-stream")
 
-		resp, err := p.client.Do(httpReq)
+		resp, err := p.clients.Stream.Do(httpReq)
 		if err != nil {
-			errs <- fmt.Errorf("anthropic stream: http call failed: %w", err)
+			errs <- provider.NewNetworkError(p.Name(), err)
 			return
 		}
 		defer resp.Body.Close()
@@ -287,9 +291,9 @@ func (p *Provider) ChatCompletionStream(ctx context.Context, req *provider.ChatR
 			respBody, _ := io.ReadAll(resp.Body)
 			var errResp anthropicErrorResponse
 			if e := json.Unmarshal(respBody, &errResp); e == nil && errResp.Error.Message != "" {
-				errs <- fmt.Errorf("anthropic stream: upstream error [%s] %s", errResp.Error.Type, errResp.Error.Message)
+				errs <- provider.NewUpstreamError(p.Name(), resp.StatusCode, errResp.Error.Type, errResp.Error.Message)
 			} else {
-				errs <- fmt.Errorf("anthropic stream: upstream returned status %d", resp.StatusCode)
+				errs <- provider.NewUpstreamError(p.Name(), resp.StatusCode, "http_error", string(respBody))
 			}
 			return
 		}
@@ -330,7 +334,7 @@ func (p *Provider) ChatCompletionStream(ctx context.Context, req *provider.ChatR
 		}
 
 		if err := scanner.Err(); err != nil {
-			errs <- fmt.Errorf("anthropic stream: scanner error: %w", err)
+			errs <- provider.NewNetworkError(p.Name(), err)
 		}
 	}()
 
