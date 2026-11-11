@@ -1,7 +1,123 @@
-# K8s Gateway 部署清单（占位）
+# K8s Gateway 部署清单
 #
 # - Deployment replicas: 3（最少 3 副本做 HA）
-# - HPA: 1 < replicas < 50，QPS 1000 扩容 / 200 缩容
-# - Secret: Provider API Key 从 Vault 挂载，不硬编码
-# - Liveness / Readiness 探针 /healthz /readyz
-# - Istio VirtualService 灰度流量切分（配合 Flagger 用）
+# - 探针拆分：liveness=/livez（进程存活即 200，不查依赖），readiness=/readyz
+#   （Ping DB+Redis，1s 超时；收到关停信号立即 503 摘流量）
+# - preStop sleep 5s：等待 endpoints 摘除传播，配合 30s 优雅退出实现 rolling update 零 5xx
+# - HPA: 3 ~ 50 副本，按每 Pod QPS 1000 扩容（Prometheus 自定义指标）
+# - PDB: 至少保留 2 个可用副本
+# - Provider API Key 从 Secret 挂载环境变量（key_ref 不落明文，见 config.example.yaml）
+# - Istio VirtualService 灰度流量切分见 gateway-canary.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: ai-gateway
+  labels:
+    app: gateway
+spec:
+  replicas: 3
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0 # 滚动期间可用副本不减少（配合 PDB）
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 40 # preStop 5s + shutdown 30s + 余量
+      containers:
+        - name: gateway
+          image: ai-gateway:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/app/configs/config.yaml"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 8081
+            # 管理面端口（阶段 15）：仅内网可达，网络隔离见 admin-networkpolicy.yaml
+            - name: admin
+              containerPort: 8082
+          envFrom:
+            - secretRef:
+                name: gateway-provider-keys # OPENAI_API_KEY / ANTHROPIC_API_KEY / ARK_API_KEY / ADMIN_TOKEN / VAULT_TOKEN ...
+          volumeMounts:
+            - name: config
+              mountPath: /app/configs
+              readOnly: true
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          # 存活探针：进程能响应即活，依赖抖动不传导为重启
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # 就绪探针：依赖不可用或关停中即摘流量
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"] # 等 endpoints 摘除传播后再收 SIGTERM
+      volumes:
+        - name: config
+          configMap:
+            name: gateway-config
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway
+  namespace: ai-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gateway
+  minReplicas: 3
+  maxReplicas: 50
+  metrics:
+    # 每 Pod 平均 QPS（由 prometheus-adapter 从 gateway_requests_total 导出）
+    - type: Pods
+      pods:
+        metric:
+          name: gateway_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "1000"
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300 # 缩容观察窗，防抖动反复扩缩
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  namespace: ai-gateway
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: gateway
